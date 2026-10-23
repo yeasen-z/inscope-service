@@ -49,9 +49,12 @@ pip install inscope[server]    # 服务端（含 fastapi / uvicorn / torch / tra
 | 按 checkpoint 声明加载架构 | `probe.py::load_probe` | 未知 schema / 架构 / 归一化方式一律报错，不回退默认 |
 | 层号自适应 | `probe.py::_resolve_layers` | 优先用 manifest 的 `inscope_layers`；否则按 `layer_semantics` 换算 |
 | 位置自适应 | `backend.py::capture(positions=)` | 位置数量不再写死单点 |
-| 拼接顺序自适应 | `probe.py::Probe.flatten` | 按 manifest 的 `flatten_order` |
+| 拼接顺序自适应 | `probe.py::Probe.flatten` | 按 manifest 的 `flatten_order`，并校验每层 `[n_pos, hidden]` |
 | 阈值来自 checkpoint | `probe.py::load_probe` | 不再查冻结的 seed 阈值表 |
 | 校验 manifest sha256 | `probe.py::load_probe` | 权重与 manifest 不匹配直接拒绝 |
+| probe_id 派生 | `probe.py::_derive_probe_id` | `架构:训练集:feature_name`，同一权重恒定、不同权重不同 |
+| profile 与探针互认 | `app.py` / `cli.py::_preflight` | `probe_id` 不匹配或位置不一致 → 启动失败 |
+| 启动自检 | `inscope-serve --preflight-only` | 缺项/错配在启动前报出，返回码 2 |
 
 ### 2.2 层号语义（重要）
 
@@ -136,10 +139,19 @@ runtime_parity        GPU validation pending   ← 原 manifest 自带
 ### 4.1 单元测试
 
 ```text
-45 passed  (原有 31 + 新增 14 个 checkpoint 自适应测试)
+59 passed  (无需 GPU)
 ```
 
-新增文件：`tests/test_probe_checkpoint.py`
+| 文件 | 数量 | 覆盖 |
+|---|---|---|
+| `test_architecture.py` | — | import 单向约束 |
+| `test_layers.py` | — | 层号换算 |
+| `test_api_cpu.py` | — | 契约常量、多位置解码、请求校验 |
+| `test_composer_profile.py` | — | profile 注册与绑定 |
+| `test_probe_checkpoint.py` | 15 | checkpoint 自适应加载与各条拒绝路径 |
+| `test_client_contract.py` | 10 | 客户端/服务字段契约、profile-probe 绑定 |
+
+`tests/conftest.py` 提供 `write_checkpoint()` 夹具，避免各文件重复拼装 checkpoint。
 
 ### 4.2 端到端验证（真实权重 + 真实 GPU）
 
@@ -181,14 +193,19 @@ accuracy: 5/5
 
 | 文件 | 改动 |
 |---|---|
-| `inscope_server/probe.py` | **重写**。`load_probe()` 按 checkpoint 自描述构造；`Probe.flatten()` / `Probe.score()` |
+| `inscope_server/probe.py` | **重写**。`load_probe()` 按 checkpoint 自描述构造；`Probe.flatten()` 校验每层形状；`_derive_probe_id()` |
 | `inscope_server/backend.py` | `capture()` 增加 `positions` 参数；`decode_features()` 支持多位置、返回层块列表 |
-| `inscope_server/app.py` | 改用 `load_probe`；`/info` 输出探针自述字段；增加最小 token 数校验 |
-| `inscope_server/config.py` | 新增 `probe_checkpoint` 字段与 `INSCOPE_PROBE_CHECKPOINT` 环境变量；移除 seed 阈值表依赖 |
-| `inscope_server/cli.py` | 启动日志改为打印 probe 路径 |
-| `inscope_server/context_profile.py` | 新增 `a6_nemotron_risk_faced_v1` profile |
+| `inscope_server/app.py` | **重写**。启动期校验 profile/probe 绑定与位置一致性；`/info` 报告探针自述；最小 token 数校验 |
+| `inscope_server/config.py` | **重写**。移除与 profile 冲突的 `composer` 副本、`threshold_logit`、`models_dir`；强制要求 checkpoint 与 profile |
+| `inscope_server/cli.py` | **重写**。新增 `_preflight()` 与 `--preflight-only` |
+| `inscope_server/context_profile.py` | 新增 `a6_nemotron_risk_faced_v1`；A5 profile 标注未支持其 checkpoint 布局 |
+| `inscope/client.py` | **重写**。对齐服务字段（`probability`/`label`）；恢复 `flagged` 兼容属性；新增 `AsyncClient` |
+| `inscope_contract/constants.py` | 新增 `RISK_TYPE`，把「风险类别」与「探针名」分开 |
+| `README.md` | 重写启动参数、层号语义、profile 表、测试说明 |
+| `tests/conftest.py` | **新增**，共用 checkpoint 夹具 |
+| `tests/test_probe_checkpoint.py` | **新增**，15 个用例 |
+| `tests/test_client_contract.py` | **新增**，10 个用例 |
 | `tests/test_api_cpu.py` | 适配新的 `decode_features` 返回值；新增多位置测试 |
-| `tests/test_probe_checkpoint.py` | **新增**，14 个测试覆盖自适应加载的各种拒绝路径 |
 
 ---
 
@@ -206,6 +223,22 @@ export INSCOPE_COMPOSER_PROFILE=a6_nemotron_risk_faced_v1
 
 > `INSCOPE_API_KEY` 是本服务对外的鉴权口令，与 GitHub token 无关。
 > `SGLANG_API_KEY` 才是访问引擎用的。
+
+启动前自检（不启动服务）：
+
+```bash
+inscope-serve --preflight-only
+```
+
+实测能拦住的错误配置：
+
+```text
+缺 profile            → INSCOPE_COMPOSER_PROFILE is required
+未知 profile          → unknown composer profile 'nope'; available: [...]
+profile 与探针不匹配   → composer profile 'a5_simplified_v1' is bound to probe 'a5_blend',
+                        but the loaded probe is 'linear:arm6_...'
+checkpoint 不存在      → Probe checkpoint not found: /nope.pt
+```
 
 ### 6.2 启动引擎
 

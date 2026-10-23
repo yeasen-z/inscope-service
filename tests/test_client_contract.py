@@ -1,0 +1,92 @@
+"""客户端与服务的字段契约必须一致；profile 与探针必须互相认领。"""
+
+import pytest
+import torch
+
+from inscope.client import DetectResult, InScopeError
+from inscope_server.context_profile import bind_profile, get_profile
+from inscope_server.probe import load_probe
+
+from conftest import DIM, LAYERS, POSITIONS, write_checkpoint
+
+
+# ---------------------------------------------------------------- 客户端契约
+def _payload(**over):
+    base = {"logit": 1.25, "probability": 0.78, "threshold": 0.9, "label": "benign",
+            "risk": "indirect_prompt_injection", "input_tokens": 42,
+            "request_id": "rid-1", "latency_ms": 12.5,
+            "composer_profile": "a6_nemotron_risk_faced_v1"}
+    base.update(over)
+    return base
+
+
+def test_client_parses_current_service_payload():
+    result = DetectResult.from_payload(_payload())
+    assert result.logit == 1.25
+    assert result.probability == 0.78
+    assert result.threshold == 0.9
+    assert result.label == "benign"
+    assert result.flagged is False
+
+
+def test_client_flagged_tracks_label():
+    assert DetectResult.from_payload(_payload(label="attack", probability=0.99)).flagged is True
+
+
+def test_client_rejects_payload_missing_required_fields():
+    with pytest.raises(InScopeError, match="Malformed"):
+        DetectResult.from_payload({"score": 1.0, "flagged": True})
+
+
+def test_client_tolerates_absent_optional_fields():
+    payload = _payload()
+    for key in ("latency_ms", "composer_profile", "risk", "request_id"):
+        payload.pop(key)
+    result = DetectResult.from_payload(payload)
+    assert result.latency_ms == 0.0
+    assert result.composer_profile == ""
+
+
+# ------------------------------------------------------- profile / probe 绑定
+def test_profile_matches_real_checkpoint_id(tmp_path):
+    """a6 profile 的 probe_id 必须等于该 checkpoint 派生出的 id。"""
+    probe = load_probe(write_checkpoint(tmp_path))
+    profile = get_profile("a6_nemotron_risk_faced_v1")
+    # 不抛异常即表示绑定成立。
+    bind_profile(profile, probe.spec.probe_id)
+
+
+def test_profile_positions_match_checkpoint(tmp_path):
+    probe = load_probe(write_checkpoint(tmp_path))
+    profile = get_profile("a6_nemotron_risk_faced_v1")
+    assert tuple(profile.composer.selected_positions) == tuple(probe.selected_positions)
+    # 位置数必须与 input_dim 自洽。
+    assert probe.input_dim == len(probe.capture_layers) * len(probe.selected_positions) * 4096
+
+
+def test_a6_profile_has_no_probe_prefix():
+    """该探针训练时无前缀；加上会改变特征分布（实测分数反转）。"""
+    profile = get_profile("a6_nemotron_risk_faced_v1")
+    assert profile.composer.probe_prefix == ""
+
+
+def test_mismatched_profile_is_rejected():
+    profile = get_profile("a5_simplified_v1")
+    with pytest.raises(ValueError, match="bound to probe"):
+        bind_profile(profile, "linear:other:dataset")
+
+
+def test_unknown_profile_is_rejected():
+    with pytest.raises(ValueError, match="unknown composer profile"):
+        get_profile("does_not_exist")
+
+
+def test_probe_id_is_stable_across_loads(tmp_path):
+    path = write_checkpoint(tmp_path)
+    assert load_probe(path).spec.probe_id == load_probe(path).spec.probe_id
+
+
+def test_probe_id_differs_for_other_feature_name(tmp_path):
+    a = load_probe(write_checkpoint(tmp_path, sub="a", feature_name="feat_a"))
+    b = load_probe(write_checkpoint(tmp_path, sub="b", feature_name="feat_b"))
+    assert a.spec.probe_id != b.spec.probe_id

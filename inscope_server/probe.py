@@ -27,7 +27,7 @@ class ProbeSpec:
     """checkpoint 自带的运行参数。所有字段都必须来自 checkpoint/manifest。"""
 
     __slots__ = (
-        "path", "schema", "probe_architecture", "input_dim", "block_indices",
+        "path", "schema", "probe_id", "probe_architecture", "input_dim", "block_indices",
         "capture_layers", "selected_positions", "feature_normalization",
         "flatten_order", "threshold", "labeling_protocol", "probe_prefix",
         "layer_semantics", "feature_name",
@@ -132,8 +132,19 @@ class Probe:
         order = list(self.spec.flatten_order or ["batch", "layer", "token", "hidden"])
         if order != ["batch", "layer", "token", "hidden"]:
             raise ValueError("Unsupported flatten_order: %r" % (order,))
+        # 每层必须是 [n_positions, hidden]，否则铺平后维度会静默错位。
+        expected = (len(self.selected_positions), LAYER_HIDDEN)
+        for idx, block in enumerate(layer_blocks):
+            if tuple(block.shape) != expected:
+                raise ValueError(
+                    "Layer block %d has shape %s, expected %s"
+                    % (idx, tuple(block.shape), expected))
         stacked = torch.stack([b.float() for b in layer_blocks], dim=0)  # [layer, token, hidden]
-        return stacked.reshape(1, -1)
+        flat = stacked.reshape(1, -1)
+        if flat.shape[-1] != self.input_dim:
+            raise ValueError("Flattened dim %d != checkpoint input_dim %d"
+                             % (flat.shape[-1], self.input_dim))
+        return flat
 
 
 def _build_module(arch: str, state: dict, input_dim: int) -> nn.Module:
@@ -161,6 +172,18 @@ def _build_module(arch: str, state: dict, input_dim: int) -> nn.Module:
     module = nn.Sequential(nn.Linear(input_dim, 1))
     module.load_state_dict(flat)
     return module.eval()
+
+
+def _derive_probe_id(ck: dict) -> str:
+    """从 checkpoint 自述信息派生稳定 id。
+
+    同一份权重每次加载必须得到同一个 id，不同权重必须得到不同的 id，
+    所以这里只用 checkpoint 内的不变量，不含路径、时间戳等环境相关字段。
+    """
+    arch = ck.get("probe_architecture") or "linear"
+    dataset = ck.get("dataset_name") or "unknown"
+    feature = ck.get("feature_name") or "unnamed"
+    return "%s:%s:%s" % (arch, dataset, feature)
 
 
 def load_probe(ckpt_path, *, expected_input_dim: int | None = None) -> Probe:
@@ -238,9 +261,15 @@ def load_probe(ckpt_path, *, expected_input_dim: int | None = None) -> Probe:
 
     flatten_order = (manifest or {}).get("flatten_order") or ck.get("flatten_order")
 
+    # probe_id 优先取 checkpoint/manifest 的显式声明，否则由架构+训练集+特征名派生。
+    # 派生而不是写死，是为了让不同 checkpoint 天然得到不同的 id，避免误配 profile。
+    probe_id = (ck.get("probe_id") or (manifest or {}).get("probe_id")
+                or _derive_probe_id(ck))
+
     spec = ProbeSpec(
         path=str(path),
         schema=schema,
+        probe_id=probe_id,
         probe_architecture=arch,
         input_dim=input_dim,
         block_indices=tuple(int(x) for x in (ck.get("selected_layer_indices") or ck.get("layer_indices") or ())),

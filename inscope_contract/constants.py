@@ -39,6 +39,10 @@ CAPTURE_DTYPE = "bfloat16"
 FEATURE_QUANTIZATION = "float8_e5m2"
 LABELING_PROTOCOL = "risk_faced"
 
+# --- 检测的风险类别 -----------------------------------------------------
+# 与具体探针无关：探针换实现也不改变「在测什么风险」。
+RISK_TYPE = "indirect_prompt_injection"
+
 # --- detector（A5 blend）------------------------------------------------
 DETECTOR_NAME = "a5_blend_linear_n1024"
 BLEND_ALPHA = 0.5

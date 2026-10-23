@@ -67,13 +67,19 @@ class ComposerProfile:
 
 # ------------------------------------------------------- profile 注册表
 def _a5_simplified_v1(prefix: str) -> ComposerProfile:
+    """A5 blend 探针的上下文编排。
+
+    注意：A5 的 checkpoint 布局（双 arm + 顶层 mean/std + 12288 维）与
+    load_probe 支持的 `fyh.probe_checkpoint.v2` 不同，本仓库当前无法加载它。
+    该 profile 保留仅为兼容既有配置，实际启动需先补上 A5 的加载路径。
+    """
     return ComposerProfile(
         profile_id="a5_simplified_v1",
         version="1",
         probe_id="a5_blend",
         description=(
             "simplified/context_composer 移植：选窗 + 去 CoT + 模板 + 尾部探测问题。"
-            "仅用于 A5 blend 探针。"
+            "仅用于 A5 blend 探针；该探针的 checkpoint 布局当前未获支持。"
         ),
         composer=ComposerConfig(probe_prefix=prefix),
         probe_prefix=prefix,
@@ -96,7 +102,7 @@ def _a6_nemotron_risk_faced_v1() -> ComposerProfile:
     return ComposerProfile(
         profile_id="a6_nemotron_risk_faced_v1",
         version="1",
-        probe_id="a6_nemotron_linear",
+        probe_id="linear:arm6_Nemotron-Post-Training-Dataset-v1-tool_calling:no_prefix_cot_last4_20261015",
         description=(
             "A6 tool-calling 线性探针的上下文编排：不加探测前缀，"
             "保留原始对话与 CoT，取最后 4 个 token 的 hidden state。"
