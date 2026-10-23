@@ -1,199 +1,217 @@
-# InScope
+# InScope Service
 
-基于模型激活的间接提示注入（IPI）检测服务。
+**将基于模型内部特征的探测方法封装为服务接口。** 接收输入上下文，按配置采集模型激活，再交给训练好的探针计算分数并返回结果。
 
-InScope 在推理服务内部**只读地**采集指定 decoder 层的残差流激活，用一个轻量探针
-给出风险分，不改变模型的输出行为。
+**服务负责“如何运行探测”，探针决定“探测什么”。** 探测目标、正负样本定义以及输出分数的业务含义，由探针的训练任务、标签定义和配套元信息决定。提示注入检测只是其中一种应用，不是 InScope Service 本身的固定定位。
 
-## 定位
+本仓库提供 **HTTP 服务、Python SDK 和共享契约**，不负责训练探针，也不分发模型权重或探针 checkpoint。方法层的定位不等于当前实现已兼容任意模型、探针结构或输出类型；具体限制见下文。
 
-InScope 是三层架构的**核心服务层**：
+## 架构与相关仓库
 
-```text
-┌──────────────────────────────────────────────┐
-│ coolwatch          业务平台                   │
-│ 前端 / 管理后台 / 评估 / 数据管线              │
-└──────────────────┬───────────────────────────┘
-                   │ pip install inscope
-                   │ from inscope import Client
-                   ▼
-┌──────────────────────────────────────────────┐
-│ inscope-service    ← 本仓库                   │
-│ 契约 + 检测服务 + 客户端 SDK                   │
-└──────────────────┬───────────────────────────┘
-                   │ HTTP /generate + feature_capture
-                   ▼
-┌──────────────────────────────────────────────┐
-│ sglang-inscope     底层驱动                   │
-│ SGLang fork，提供 residual-stream 激活采集     │
-└──────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    caller["CoolWatch / 其他调用方"]
+    service["InScope Service · 探测方法的服务接口"]
+    engine["sglang-inscope · 模型推理与激活采集"]
+    probe["训练好的探针 + 任务与标签定义"]
+    profile["Context Composer profile · 输入编排规则"]
+
+    caller -->|HTTP / Python SDK| service
+    profile -->|构造用于提取特征的上下文| service
+    probe -->|定义探测目标与打分方式| service
+    service -->|请求指定层与 token 位置的特征| engine
+    engine -->|返回激活特征| service
+    service -->|返回探针分数与判定结果| caller
+
+    click caller "https://github.com/RebeccaZhang22/CoolWatch" "打开 CoolWatch 仓库" _blank
+    click service "https://github.com/yeasen-z/inscope-service" "打开 InScope Service 仓库" _blank
+    click engine "https://github.com/yeasen-z/sglang-inscope" "打开 sglang-inscope 仓库" _blank
 ```
 
-本仓库不包含模型权重，也不包含探针 checkpoint。**权重单独分发。**
+图使用 GitHub Markdown 支持的 Mermaid 渲染。节点附带仓库链接；若阅读器禁用图中点击或不支持 Mermaid，可直接使用以下链接：
 
-## 核心设计：探针由 checkpoint 自描述
-
-服务**不预设任何一套探针结构**。层号、位置、归一化方式、拼接顺序、架构和阈值
-全部从 checkpoint（及其同目录的 `manifest.json`）读取：
-
-| 参数 | 来源 |
+| 仓库 | 职责 |
 | --- | --- |
-| 层号 | `manifest.inscope_layers`，否则按 `layer_semantics` 由 `block_indices` 换算 |
-| 位置 | `selected_positions`，如 `[-4,-3,-2,-1]` |
-| 归一化 | `model_state_dict.input_mean` / `input_std` |
-| 拼接顺序 | `manifest.flatten_order` |
-| 架构 | `probe_architecture` |
-| 阈值 | `threshold` |
+| [CoolWatch](<https://github.com/RebeccaZhang22/CoolWatch>) | 业务平台，消费探测结果；不是使用本服务的必要依赖 |
+| [InScope Service](<https://github.com/yeasen-z/inscope-service>) | 上下文编排、探针加载、特征请求、打分与服务接口 |
+| [sglang-inscope](<https://github.com/yeasen-z/sglang-inscope>) | 底层推理驱动，运行模型并提供激活采集接口，需单独部署 |
 
-未知 schema、未知架构、未知归一化方式**一律报错**，不回退到任何默认探针。
-`manifest.sha256` 存在时会校验，权重与 manifest 不匹配直接拒绝。
-
-这意味着换一个 checkpoint 不需要改代码，只需要换文件并选对 composer profile。
+单次探测流程：**输入上下文 → Composer 编排 → 引擎提取特征 → 探针打分 → 返回结果**。业务调用方根据该探针的任务与标签定义解释结果，而不是由服务名称推断含义。
 
 ## 快速开始
 
-```bash
-# 只装客户端（调用方）：不会拖进 torch / fastapi
-pip install inscope
+### 1. 安装
 
-# 装服务端：起服务必须装这个
-pip install inscope[server]
+需要 Python **3.11 或以上**。以下从本仓库安装，不依赖 PyPI 是否已发布对应版本：
+
+```bash
+git clone https://github.com/yeasen-z/inscope-service.git
+cd inscope-service
+
+# 部署检测服务
+python -m pip install ".[server]"
+
+# 若只在调用方使用 SDK，改用：
+# python -m pip install .
 ```
 
-> 只装 `inscope` 后直接起服务会在运行期报 ImportError，这是刻意的取舍：
-> 客户端保持轻量，服务端必须显式安装 `[server]` extra。
+仅客户端安装不会引入 torch、transformers、FastAPI 或 uvicorn。
 
-启动服务（需要先把 sglang-inscope 的 engine 跑起来）：
+### 2. 准备模型、引擎和探针
+
+启动前需要准备：
+
+1. **模型与 tokenizer**：当前服务校验的是 Qwen3-8B-FP8，需提供本地权重目录。
+2. **sglang-inscope 引擎**：与服务使用相同模型，启动时启用 `SGLANG_ENABLE_FEATURE_CAPTURE=1`；普通 SGLang 不保证支持特征接口。
+3. **可信的探针 checkpoint**：当前已验证 `fyh.probe_checkpoint.v2` 线性探针；如有配套 `manifest.json`，放在权重同目录。
+4. **匹配的 Composer profile**：必须与探针训练时的上下文处理规则一致，不能仅凭名称或位置数选择。
+
+服务不会自动启动引擎。下面假定引擎已监听 `http://127.0.0.1:31100`。
+
+### 3. 配置并启动
+
+替换下列路径、口令和 profile ID：
 
 ```bash
-export INSCOPE_MODEL_PATH=/path/to/Qwen3-8B-FP8
-export INSCOPE_API_KEY=<对外鉴权口令>
-export INSCOPE_ENGINE_URL=http://127.0.0.1:31100
-export INSCOPE_PROBE_CHECKPOINT=/path/to/best.pt
-export INSCOPE_COMPOSER_PROFILE=a6_nemotron_risk_faced_v1
+export INSCOPE_MODEL_PATH='/path/to/Qwen3-8B-FP8'
+export INSCOPE_PROBE_CHECKPOINT='/path/to/probe/best.pt'
+export INSCOPE_COMPOSER_PROFILE='replace-with-matching-profile-id'
+export INSCOPE_API_KEY='replace-with-a-strong-secret'
+export INSCOPE_ENGINE_URL='http://127.0.0.1:31100'
 
-inscope-serve --host 0.0.0.0 --port 8302
-```
-
-启动前可先做一次自检（不启动服务，失败返回码 2）：
-
-```bash
+# 检查 checkpoint 与 profile，不启动 HTTP 服务，也不访问引擎
 inscope-serve --preflight-only
+
+# 启动服务；仅需本机访问时保持此监听地址
+inscope-serve --host 127.0.0.1 --port 8302
 ```
 
-自检会打印探针 id、层号、位置、维度、阈值和 profile，并在以下情况直接失败：
+可用 profile 及绑定条件见 [profile 注册表](<inscope_server/context_profile.py>)。启动自检成功不代表模型、引擎或整个检测链路已就绪；还需调用下面的就绪接口。
 
-- 缺 `INSCOPE_PROBE_CHECKPOINT` 或 `INSCOPE_COMPOSER_PROFILE`
-- profile id 未知
-- profile 与探针的 `probe_id` 不匹配
-- profile 声明的取位置与 checkpoint 声明不一致
-- checkpoint 缺失、schema 不支持、维度不自洽
+### 4. 验证就绪并检测
 
-调用：
+```bash
+curl --fail-with-body http://127.0.0.1:8302/health/ready \
+  -H "Authorization: Bearer ${INSCOPE_API_KEY}"
+
+curl --fail-with-body http://127.0.0.1:8302/detect \
+  -H "Authorization: Bearer ${INSCOPE_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Please summarize this report."}]}'
+```
+
+`/health/ready` 会实际执行一次特征采集与探针打分，不只是检查端口。
+
+## Python SDK
+
+### 同步调用
 
 ```python
+import os
 from inscope import Client
 
-client = Client("http://127.0.0.1:8302", api_key="...")
-result = client.detect([{"role": "user", "content": "..."}])
+client = Client("http://127.0.0.1:8302", api_key=os.environ["INSCOPE_API_KEY"])
+result = client.detect([
+    {"role": "user", "content": "Please summarize this report."}
+])
 print(result.label, result.probability, result.threshold)
 ```
 
-异步调用用 `inscope.client.AsyncClient`。
-
-## 包结构
-
-| 包 | 作用 | 依赖方向 |
-| --- | --- | --- |
-| `inscope_contract` | 协议：端点、常量、数据模型、层号语义 | 不依赖任何上层包 |
-| `inscope_server` | FastAPI 服务：Composer → 特征采集 → 打分 | → contract |
-| `inscope` | 同步/异步客户端 SDK | → contract |
-
-依赖是**严格单向**的，由 `tests/test_architecture.py` 静态检查 import 图来保证。
-`inscope_server` 与 `inscope` 之间禁止互相 import。
-
-## 层号语义（重要）
-
-三层对「层」的说法不同，换算**只有一处**：`inscope_contract/layers.py`。
-
-| 概念 | 含义 |
-| --- | --- |
-| block index | 探针 checkpoint 里的说法：「第 b 个 decoder block 的输出」 |
-| residual boundary | SGLang 的说法：`0`=embedding 输出，`1..N-1`=第 `L-1` 个 block 输出，`N`/`-1`=最后一层 |
-
-换算规则：
-
-```text
-BLOCK_OUTPUT  ->  boundary = block + 1
-BOUNDARY      ->  原样透传
-```
-
-Qwen3-8B 是 36 层，所以 `block_indices [8,16,24]` 对应 `inscope_layers [9,17,25]`。
-
-**checkpoint 未声明语义且无 manifest 时直接报错**，不做默认假设。
-任何模块都不允许自己写 `block + 1`。
-
-## Context Composer
-
-送进模型提取特征的上下文不一定是调用方原样传的 messages。Composer 按 **profile**
-决定如何组织（选窗、去 CoT、合并 assistant、模板渲染、追加探测问题），profile 与
-探针通过 `probe_id` **绑定**：
+### 异步调用
 
 ```python
-ComposerProfile(
-    profile_id="a6_nemotron_risk_faced_v1",
-    version="1",
-    probe_id="linear:arm6_...:no_prefix_cot_last4_20261015",  # 不匹配就拒绝启动
-    position_mode="last",
-)
+import asyncio
+import os
+from inscope.client import AsyncClient
+
+async def main():
+    async with AsyncClient(
+        "http://127.0.0.1:8302", api_key=os.environ["INSCOPE_API_KEY"]
+    ) as client:
+        result = await client.detect([
+            {"role": "user", "content": "Please summarize this report."}
+        ])
+        print(result.label, result.probability)
+
+asyncio.run(main())
 ```
 
-- 未知 profile → 启动失败，不回落默认
-- profile 与探针 `probe_id` 不匹配 → 启动失败
-- profile 取的 token 位置与 checkpoint 声明不一致 → 启动失败
-- 没有实现的 profile → HTTP 501，不用别的规则凑
-- 响应里回显 `profile_id` / `profile_version`，便于事后审计
+两种客户端均提供 `detect(messages, tools=None, request_id=None)`、`info()` 和 `ready()`。
 
-`probe_id` 未在 checkpoint 中显式声明时，由 `架构:训练集:feature_name` 派生，
-保证同一份权重得到同一个 id、不同权重得到不同 id。
+## HTTP 接口
 
-### 已注册 profile
+除存活检查外，接口均要求 `Authorization: Bearer <INSCOPE_API_KEY>`。
 
-| profile | 适用探针 | 前缀 | 位置 |
-| --- | --- | --- | --- |
-| `a6_nemotron_risk_faced_v1` | `fyh.probe_checkpoint.v2` 线性探针 | **无** | `[-4,-3,-2,-1]` |
-| `a5_simplified_v1` | A5 blend（**当前未支持其 checkpoint 布局**） | 有 | `[-1]` |
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/health/live` | 进程存活检查，不验证模型或引擎 |
+| GET | `/health/ready` | 实际运行检测链路，确认服务就绪 |
+| GET | `/info` | 查询当前探针、层号、位置、阈值和 Composer 配置 |
+| POST | `/detect` | 检测对话；请求包含 `messages`，可选 `tools` |
 
-> `a6` 这个探针训练时**没有**探测问题前缀（`feature_name` 即 `no_prefix_...`）。
-> 给它加前缀会让分数完全反转 —— 实测 attack 样本的 logit 从 `+28` 掉到 `-12`。
-> profile 里的参数必须与训练配置严格一致，不能凭语义相似去猜。
+检测结果的主要字段：
 
-## 开发
+| 字段 | 含义 |
+| --- | --- |
+| `logit` | 探针输出的原始分数 |
+| `probability` | 当前二分类实现中的 `sigmoid(logit)`；正类含义由探针的训练标签定义，不保证经过概率校准 |
+| `threshold` | checkpoint 提供的判定阈值，在 probability 空间比较 |
+| `label` | `probability >= threshold` 时为 `attack`，否则为 `benign` |
+| `input_tokens` | Composer 实际输出的 token 数 |
+| `composer_profile` / `composer` | 使用的 profile ID 与编排配置 |
+| `checkpoint_sha256` | 权重文件摘要，用于追踪具体文件 |
+| `request_id` / `latency_ms` | 请求标识与服务端处理耗时 |
+
+**当前接口仍有提示注入场景的历史命名**：`label` 使用 `attack` / `benign`，`risk` 固定为 `indirect_prompt_injection`。这些字段目前没有随探针任务动态变化，不能据此宣称服务已支持任意任务语义。接入其他任务时，需要同时适配输出标签与任务元信息；仅替换权重不会自动完成这一步。
+
+常见错误：`401` 鉴权失败、`413` 输入超限、`422` 输入不合法、`429` 并发已满、`503` 特征后端或打分异常、`504` 超时。超长输入会被拒绝，不会静默截断。
+
+## 配置参考
+
+| 环境变量 | 必填 / 默认值 | 说明 |
+| --- | --- | --- |
+| `INSCOPE_MODEL_PATH` | 必填 | 本地模型与 tokenizer 目录 |
+| `INSCOPE_PROBE_CHECKPOINT` | 必填 | 探针权重文件路径 |
+| `INSCOPE_COMPOSER_PROFILE` | 必填 | 已注册且与探针匹配的 profile ID |
+| `INSCOPE_API_KEY` | 必填 | 调用本服务的鉴权口令 |
+| `INSCOPE_ENGINE_URL` | `http://127.0.0.1:30000` | sglang-inscope 引擎地址 |
+| `SGLANG_API_KEY` | 空 | 引擎启用鉴权时使用，与本服务口令不同 |
+| `INSCOPE_MAX_INPUT_TOKENS` | `40959` | 输入 token 上限，可调小 |
+| `INSCOPE_MAX_INFLIGHT` | `16` | 检测及就绪检查的并发上限 |
+| `INSCOPE_REQUEST_TIMEOUT` | `60` | 请求超时，单位秒 |
+
+HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为 `0.0.0.0:8302`；对外部署时应限制访问并在代理层配置 TLS。
+
+## 更换探针与上下文规则
+
+**先确认探针在训练时学的是哪个目标，再对齐特征提取与输入编排规则。** 权重本身不一定包含完整的任务说明，交付探针时还应附带训练目标、标签定义、阈值含义和验证记录。
+
+- **探测任务**：由训练目标与标签定义决定；服务执行探针，不替探针定义业务含义。
+- **Checkpoint / manifest**：提供层号、token 位置、归一化参数、输入维度和阈值。manifest 声明 SHA-256 时，服务会校验权重文件。
+- **Composer profile**：控制对话选窗、CoT 处理、模板渲染和探测前缀。服务会检查 profile 与探针的 `probe_id` 绑定，以及位置配置的一致性。
+- **身份与文件分开**：未显式声明 `probe_id` 时，服务从架构、数据集名和 `feature_name` 派生。同一组元信息可对应不同权重；具体文件应以 `checkpoint_sha256` 区分。
+
+更换步骤：准备权重及配套元信息 → 选择或实现匹配的 profile → 修改环境变量 → 运行自检 → 重启并验证就绪及代表性样本。
+
+**不能承诺任意 checkpoint 换文件即可运行。** 当前实现以 Qwen3-8B-FP8、hidden size 4096、标准归一化和 `[batch, layer, token, hidden]` 铺平顺序为基础，已验证的是 v2 线性探针。新架构、新编排策略需要实现与验证；保留的 `a5_simplified_v1` profile 不代表已支持 A5 blend 权重加载。
+
+层号也必须显式对齐：SGLang 使用 residual-stream **边界号**。若 checkpoint 声明的是零起始 decoder block 输出，`block b` 对应 `boundary b + 1`；若已声明边界号则不转换。优先采用 manifest 的 `inscope_layers`，没有可用语义时拒绝加载。详见 [层号契约](<inscope_contract/layers.py>)。
+
+> 仅加载可信来源的 checkpoint；当前加载器使用 PyTorch pickle 反序列化。上下文规则应以训练配置为依据，不应通过调整前缀来迎合几条测试样本的分数。
+
+## 开发与验证
+
+在仓库根目录执行：
 
 ```bash
-pip install -e ".[dev]"
-pytest -q
+python -m pip install -e ".[server,dev]"
+python -m pytest -q
 ```
 
-测试全部可无 GPU 运行：
+代码分为三个包：`inscope_contract`（共享契约）、`inscope_server`（服务端）、`inscope`（客户端）。服务端和客户端各自依赖 contract，互不导入；[架构测试](<tests/test_architecture.py>)检查该约束。
 
-| 文件 | 覆盖 |
-| --- | --- |
-| `test_architecture.py` | import 方向约束 |
-| `test_layers.py` | 层号换算 |
-| `test_api_cpu.py` | 契约常量、特征解码（含多位置）、请求校验 |
-| `test_composer_profile.py` | profile 注册与绑定 |
-| `test_probe_checkpoint.py` | checkpoint 自适应加载的各种拒绝路径 |
-| `test_client_contract.py` | 客户端与服务字段契约、profile/probe 绑定 |
-
-`tests/conftest.py` 提供构造合规 checkpoint 的共用夹具。
-
-## 不做什么
-
-- 不训练探针，不产出权重
-- 不实现 SGLang 的激活采集（在 `sglang-inscope`）
-- 不改写模型输出，只读激活
+现有单元测试无需 GPU；真实端到端验证另需模型、探针与引擎。少量样本跑通不等于检出率、误报率或训练侧数值一致性已验证。具体实验、部署记录及待办见 [交接文档](<HANDOFF.md>)。
 
 ## License
 
-见 [LICENSE](LICENSE)。
+见 [LICENSE](<LICENSE>)。
