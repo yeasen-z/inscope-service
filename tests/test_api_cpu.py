@@ -56,7 +56,20 @@ def test_contract_constants_self_consistent():
 
 def test_decode_valid_records():
     hidden = decode_features({"meta_info": {"features": _good_records()}}, CAPTURE_LAYERS, [11])
-    assert tuple(hidden.shape) == FEATURE_SHAPE
+    # decode_features 现在返回按请求顺序排列的层块列表，铺平与形状校验交给 probe。
+    assert isinstance(hidden, list) and len(hidden) == len(CAPTURE_LAYERS)
+    for block in hidden:
+        assert tuple(block.shape) == (len(SELECTED_POSITIONS), LAYER_HIDDEN)
+
+
+def test_decode_supports_multiple_positions():
+    """位置数量由探针决定：4 个位置也要能正确解码并保持请求顺序。"""
+    positions = [7, 8, 9, 10]
+    records = [_record(layer, positions, [len(positions), LAYER_HIDDEN],
+                       [[0.25] * LAYER_HIDDEN] * len(positions))
+               for layer in CAPTURE_LAYERS]
+    hidden = decode_features({"meta_info": {"features": records}}, CAPTURE_LAYERS, positions)
+    assert [tuple(b.shape) for b in hidden] == [(len(positions), LAYER_HIDDEN)] * len(CAPTURE_LAYERS)
 
 
 @pytest.mark.parametrize("mutation, reason", [

@@ -82,8 +82,38 @@ def _a5_simplified_v1(prefix: str) -> ComposerProfile:
     )
 
 
+def _a6_nemotron_risk_faced_v1() -> ComposerProfile:
+    """A6 / Nemotron tool-calling 线性探针（fyh.probe_checkpoint.v2）。
+
+    全部参数取自该 checkpoint 自己声明的 feature_name
+    `no_prefix_cot_last4_20261015`，对应训练配置
+    featurize/settings/external_catalog_setting2.json：
+      * 不加 probe_prefix（feature_name 即以 no_prefix 开头）；
+      * 取最后 4 个 token（selected_positions = [-4,-3,-2,-1]）；
+      * 保留 CoT（discard_cots=False）。
+    不要给这个探针加任何探测问题前缀，那会改变特征分布。
+    """
+    return ComposerProfile(
+        profile_id="a6_nemotron_risk_faced_v1",
+        version="1",
+        probe_id="a6_nemotron_linear",
+        description=(
+            "A6 tool-calling 线性探针的上下文编排：不加探测前缀，"
+            "保留原始对话与 CoT，取最后 4 个 token 的 hidden state。"
+        ),
+        composer=ComposerConfig(probe_prefix="",
+                                discard_cots=False,
+                                retain_n_assistant_turns=-1,
+                                selected_positions=(-4, -3, -2, -1)),
+        probe_prefix="",
+        position_mode="last",
+        invariants={"selected_positions": (-4, -3, -2, -1), "probe_prefix": ""},
+    )
+
+
 PROFILES = {
     "a5_simplified_v1": _a5_simplified_v1,
+    "a6_nemotron_risk_faced_v1": _a6_nemotron_risk_faced_v1,
 }
 
 

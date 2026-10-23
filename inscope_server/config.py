@@ -43,7 +43,8 @@ class Settings:
     composer_profile: str = "a5_simplified_v1"
     composer: ComposerConfig = ComposerConfig(probe_prefix=DEFAULT_PROBE_PREFIX)
     models_dir: str = DEFAULT_MODELS_DIR
-    detector_seed: int = DEFAULT_SEED
+    # 探针 checkpoint 路径。结构、层号、位置、阈值全部由该文件自描述。
+    probe_checkpoint: str = ""
     threshold_logit: float | None = None
     backend_url: str = "http://127.0.0.1:%d" % DEFAULT_ENGINE_PORT
     backend_api_key: str = ""
@@ -63,8 +64,7 @@ class Settings:
         if self.threshold_logit is not None and not math.isfinite(self.threshold_logit):
             raise ValueError("threshold_logit must be finite")
         # 阈值只对「不合并」composer 配置标定过；换 seed 或开 merge 必须重评。
-        if self.threshold_logit is None and self.detector_seed not in THRESHOLD_LOGIT:
-            raise ValueError("No calibrated threshold for seed %d" % self.detector_seed)
+        # 阈值由 checkpoint 携带，这里不再要求 seed 与冻结阈值表匹配。
         if not self.backend_url.startswith(("http://", "https://")):
             raise ValueError("INSCOPE_ENGINE_URL must be an HTTP URL")
 
@@ -85,7 +85,7 @@ class Settings:
                 selected_positions=(-1,),
             ),
             models_dir=os.getenv("INSCOPE_DETECTOR_DIR", DEFAULT_MODELS_DIR),
-            detector_seed=int(os.getenv("INSCOPE_DETECTOR_SEED", str(DEFAULT_SEED))),
+            probe_checkpoint=os.getenv("INSCOPE_PROBE_CHECKPOINT", ""),
             threshold_logit=float(threshold) if threshold else None,
             backend_url=os.getenv("INSCOPE_ENGINE_URL", "http://127.0.0.1:%d" % DEFAULT_ENGINE_PORT).rstrip("/"),
             backend_api_key=os.getenv("SGLANG_API_KEY", ""),

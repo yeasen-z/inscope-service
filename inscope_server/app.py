@@ -15,7 +15,7 @@ from inscope_contract import DETECTOR_NAME, DetectionRequest, ENDPOINTS, MODEL_L
 from .backend import BackendError, InScopeBackend
 from .config import INSCOPE_COMMIT, Settings, validate_model
 from .context_profile import compose, get_profile
-from .probe import Probe
+from .probe import Probe, load_probe
 from .normalization import normalize_payload
 
 log = logging.getLogger(__name__)
@@ -37,8 +37,11 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(settings.model_path, local_files_only=True,
                                                      trust_remote_code=False)
-        # setup 一次加载两支权重与阈值；不逐请求加载。
-        probe = probe or Probe(settings.models_dir, settings.detector_seed, settings.threshold_logit)
+        # 探针结构与层号完全由 checkpoint 自描述决定，不在此处写死任何一套。
+        if probe is None:
+            if not getattr(settings, "probe_checkpoint", ""):
+                raise ValueError("INSCOPE_PROBE_CHECKPOINT is required")
+            probe = load_probe(settings.probe_checkpoint)
         backend = backend or InScopeBackend(settings)
         try:
             yield
@@ -65,17 +68,25 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
         ids = list(ctx.input_ids)
         if len(ids) > settings.max_tokens:
             raise HTTPException(413, f"Input exceeds {settings.max_tokens} tokens; no truncation applied")
+        # 探针声明的负向位置要求输入至少有这么长；提前给出明确原因。
+        need = max((-p for p in probe.selected_positions if p < 0), default=0)
+        if len(ids) < need:
+            raise HTTPException(422, "Input has %d tokens but the probe needs at least %d"
+                                % (len(ids), need))
         try:
-            hidden = await backend.capture(ids, probe.capture_layers)
+            hidden = await backend.capture(ids, probe.capture_layers, probe.selected_positions)
         except TimeoutError as exc:
             raise HTTPException(504, "SGLang request timed out") from exc
         except BackendError as exc:
             log.warning("Shadow backend failed: %s", type(exc).__name__)
             raise HTTPException(503, "Shadow feature backend unavailable") from exc
         try:
-            score = probe.score(hidden)
+            logit, prob = probe.score(probe.flatten(hidden))
         except ValueError as exc:
             raise HTTPException(503, "Invalid InScope features or score") from exc
+        score = {"logit": logit, "probability": prob,
+                 "threshold": probe.threshold,
+                 "label": "attack" if prob >= probe.threshold else "benign"}
         return score, len(ids), ctx.profile
 
     @app.get(ENDPOINTS["live"])
@@ -92,7 +103,8 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
         inflight += 1
         try:
             async with asyncio.timeout(settings.timeout):
-                _, _, profile_used = await capture([{"role": "user", "content": "Hello"}])
+                _, _, profile_used = await capture(
+                    [{"role": "user", "content": "Hello, please confirm the detection pipeline is operational."}])
             return {"status": "ready", "model": "Qwen3-8B-FP8",
                     "capture_layers": list(probe.capture_layers),
                     "composer_profile": profile_used}
@@ -104,28 +116,26 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
     @app.get(ENDPOINTS["info"])
     async def info(request: Request):
         authenticate(request)
+        spec = probe.spec
         return {"model": "Qwen3-8B-FP8", "quantization": "fp8", "risk": "indirect_prompt_injection",
-                "detector": DETECTOR_NAME, "detector_seed": probe.seed,
-                "blend_alpha": probe.blend_alpha,
-                "checkpoint_sha256": probe.linear_sha256,
-                "linear_sha256": probe.linear_sha256, "mlp_sha256": probe.mlp_sha256,
+                "detector": DETECTOR_NAME,
+                "probe_schema": spec.schema,
+                "probe_architecture": spec.probe_architecture,
+                "checkpoint_sha256": probe.sha256,
                 "threshold": probe.threshold, "threshold_unit": "sigmoid",
-                "threshold_logit": probe.threshold_logit, "threshold_logit_unit": "logit",
                 "setting": "simplified", "composer": profile.describe(),
-                "block_indices": list(probe.block_indices),
+                "layer_semantics": spec.layer_semantics,
+                "block_indices": list(spec.block_indices),
                 "capture_layers": list(probe.capture_layers),
                 "selected_positions": list(probe.selected_positions),
-                "feature_shape": list(probe.feature_shape), "input_dim": probe.input_dim,
-                "feature_quantization": "float8_e5m2", "labeling_protocol": "risk_faced",
+                "feature_normalization": spec.feature_normalization,
+                "flatten_order": list(spec.flatten_order),
+                "input_dim": probe.input_dim,
+                "feature_name": spec.feature_name,
+                "labeling_protocol": spec.labeling_protocol,
                 "enable_thinking": composer.enable_thinking if composer else None,
                 "max_input_tokens": settings.max_tokens,
-                "inscope_commit": INSCOPE_COMMIT,
-                "fp8_probe_calibration": "source_A6_validated_runtime_parity_pending",
-                "threshold_calibration": "frozen_A5_cell_seed_thresholds_non_merged_config",
-                "threshold_calibration_note": (
-                    "阈值取自冻结的 A5 cell results；未合并配置。"
-                    "实测 FPR 随 split 变化（validation 2.37% / test 1.06% / extra80k 1.86%），"
-                    "不要假定 1% 或跨配置等效。")}
+                "inscope_commit": INSCOPE_COMMIT}
 
     @app.post(ENDPOINTS["detect"])
     async def detect(request: Request):
@@ -152,11 +162,10 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
                 result, tokens, profile_used = await capture(parsed.messages, parsed.tools)
                 return {**result, "risk": "indirect_prompt_injection", "model": MODEL_LABEL,
                         "setting": "simplified",
-                        "detector_seed": probe.seed,
                         "composer": profile_used,
                         "composer_profile": profile_used["profile_id"],
                         "normalization": {"applied": bool(changes), "changes": changes},
-                        "checkpoint_sha256": probe.linear_sha256, "input_tokens": tokens,
+                        "checkpoint_sha256": probe.sha256, "input_tokens": tokens,
                         "request_id": request_id, "latency_ms": round((time.perf_counter() - start) * 1000, 2)}
         except TimeoutError as exc:
             raise HTTPException(504, "Detection deadline exceeded") from exc

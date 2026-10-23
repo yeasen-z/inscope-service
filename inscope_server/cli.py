@@ -22,8 +22,8 @@ def main(argv=None):
 
     # 提前校验配置，让缺项在启动前报出来，而不是首个请求时才炸。
     settings = Settings.from_env()
-    log.info("engine=%s model=%s seed=%d", settings.backend_url,
-             settings.model_path, settings.detector_seed)
+    log.info("engine=%s model=%s probe=%s", settings.backend_url,
+             settings.model_path, settings.probe_checkpoint)
 
     from .app import create_app
     uvicorn.run(create_app(settings), host=args.host, port=args.port,

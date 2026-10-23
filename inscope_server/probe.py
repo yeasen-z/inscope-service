@@ -1,132 +1,266 @@
+"""按 checkpoint 自描述加载探针。
+
+设计原则：server 不预设任何一套探针结构。层号、位置、归一化方式、
+拼接顺序、架构与阈值全部从 checkpoint（及其 manifest.json）读取。
+未知的 schema / 架构 / 归一化方式一律报错，不回退到某个默认探针。
+"""
+
 import hashlib
-import math
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from inscope_contract import (
-    BLEND_ALPHA,
-    BLOCK_INDICES,
-    CAPTURE_LAYERS,
-    DEFAULT_SEED,
-    FEATURE_SHAPE,
-    INPUT_DIM,
-    LAYER_HIDDEN,
-    SELECTED_POSITIONS,
-    THRESHOLD_LOGIT,
-    LayerSemantics,
-    blend_arms,
-    build_layer_spec,
-)
+from inscope_contract import LayerSemantics, build_layer_spec
+
+# 探针输出维度须与 SGLang 隐藏维一致。
+LAYER_HIDDEN = 4096
+
+# 支持的 checkpoint schema -> 归一化字段名所在位置。
+SUPPORTED_SCHEMAS = ("fyh.probe_checkpoint.v2",)
 
 
-class Probe:
-    """A5 blend detector：12288 维 last1 特征，Linear 与 N1024 的 logit 混合。
+class ProbeSpec:
+    """checkpoint 自带的运行参数。所有字段都必须来自 checkpoint/manifest。"""
 
-    两支各自 .eval()，在 logit 空间按 alpha=0.5 混合；不混合 sigmoid 分数，
-    也不把三个 seed 再平均成一个未校准模型。
+    __slots__ = (
+        "path", "schema", "probe_architecture", "input_dim", "block_indices",
+        "capture_layers", "selected_positions", "feature_normalization",
+        "flatten_order", "threshold", "labeling_protocol", "probe_prefix",
+        "layer_semantics", "feature_name",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            object.__setattr__(self, k, kw.get(k))
+
+    def as_dict(self):
+        return {k: getattr(self, k) for k in self.__slots__}
+
+
+def _read_manifest(ckpt_path: Path) -> dict | None:
+    """同目录下的 manifest.json 是层号与位置的权威来源。"""
+    manifest = ckpt_path.parent / "manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid manifest.json next to %s: %s" % (ckpt_path, exc))
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_layers(ck: dict, manifest: dict | None) -> tuple[tuple[int, ...], LayerSemantics]:
+    """确定 SGLang 边界层号。
+
+    优先用 manifest 显式给出的 inscope_layers（已换算好的边界号）；
+    否则用 checkpoint 的 block_indices 按声明的语义换算。
     """
+    if manifest and manifest.get("inscope_layers"):
+        layers = tuple(int(x) for x in manifest["inscope_layers"])
+        # manifest 给出的是边界号，本身已是最终形态。
+        return layers, LayerSemantics.BOUNDARY
 
-    # 全部来自契约包，不在实现里重复字面量。
-    block_indices = BLOCK_INDICES
-    # 层号换算只有一个出口：契约包的 build_layer_spec。
-    layer_spec = build_layer_spec(BLOCK_INDICES, LayerSemantics.BLOCK_OUTPUT)
-    capture_layers = layer_spec.capture_layers
-    assert capture_layers == CAPTURE_LAYERS, "契约常量与层号换算不一致"
-    selected_positions = SELECTED_POSITIONS
-    input_dim = INPUT_DIM
-    feature_shape = FEATURE_SHAPE
-    blend_alpha = BLEND_ALPHA
-    hidden = LAYER_HIDDEN
+    blocks = ck.get("selected_layer_indices") or ck.get("layer_indices")
+    if not blocks:
+        raise ValueError("Checkpoint declares no layer indices")
+    blocks = tuple(int(x) for x in blocks)
+    semantic = ck.get("layer_semantics")
+    if semantic == LayerSemantics.BOUNDARY.value:
+        return blocks, LayerSemantics.BOUNDARY
+    if semantic == LayerSemantics.BLOCK_OUTPUT.value:
+        spec = build_layer_spec(blocks, LayerSemantics.BLOCK_OUTPUT)
+        return spec.capture_layers, LayerSemantics.BLOCK_OUTPUT
+    raise ValueError(
+        "Checkpoint has no usable layer semantics (layer_semantics=%r); "
+        "provide manifest.json with explicit inscope_layers" % (semantic,)
+    )
 
-    def __init__(self, models_dir, seed=DEFAULT_SEED, threshold_logit=None):
-        self.models_dir = Path(models_dir)
-        self.seed = int(seed)
-        arms = blend_arms(self.seed)
-        self.linear_path = self.models_dir / arms["linear"]
-        self.mlp_path = self.models_dir / arms["mlp"]
 
-        linear_ck = self._load(self.linear_path, "linear")
-        mlp_ck = self._load(self.mlp_path, "mlp")
-        self.linear_sha256 = hashlib.sha256(self.linear_path.read_bytes()).hexdigest()
-        self.mlp_sha256 = hashlib.sha256(self.mlp_path.read_bytes()).hexdigest()
+@dataclass
+class Probe:
+    """一个按 checkpoint 声明的结构实例化的探针。"""
 
-        self.linear = self._build_linear(linear_ck["model_state_dict"])
-        self.mlp = self._build_mlp(mlp_ck["model_state_dict"])
+    path: Path
+    spec: ProbeSpec
+    module: nn.Module
+    mean: torch.Tensor
+    std: torch.Tensor
+    threshold: float
+    sha256: str = field(default="")
 
-        # 同一 cell 两支训练归一化相同；不一致就是拿错了权重。
-        mean, std = linear_ck["mean"].float(), linear_ck["std"].float()
-        if not torch.equal(mean, mlp_ck["mean"].float()) or not torch.equal(std, mlp_ck["std"].float()):
-            raise ValueError("Blend arms disagree on training mean/std")
-        if mean.shape != (self.input_dim,) or std.shape != (self.input_dim,):
-            raise ValueError("Training mean/std must be [%d]" % self.input_dim)
-        if not (torch.isfinite(mean).all() and torch.isfinite(std).all()) or not (std > 0).all():
-            raise ValueError("Invalid training mean/std")
-        self.mean, self.std = mean, std
+    @property
+    def input_dim(self) -> int:
+        return self.spec.input_dim
 
-        default_threshold = THRESHOLD_LOGIT.get(self.seed)
-        if default_threshold is None and threshold_logit is None:
-            raise ValueError("No calibrated threshold for seed %d; pass threshold_logit" % self.seed)
-        self.threshold_logit = float(threshold_logit if threshold_logit is not None else default_threshold)
-        self.threshold = float(torch.sigmoid(torch.tensor(self.threshold_logit)).item())
+    @property
+    def capture_layers(self) -> Sequence[int]:
+        return self.spec.capture_layers
 
-    @staticmethod
-    def _load(path, arm):
-        if not Path(path).is_file():
-            raise ValueError("Missing %s checkpoint: %s" % (arm, path))
-        ck = torch.load(path, map_location="cpu", weights_only=True)
-        if not isinstance(ck, dict) or "model_state_dict" not in ck:
-            raise ValueError("Unsupported %s checkpoint layout" % arm)
-        if ck.get("input_dim") != Probe.input_dim:
-            raise ValueError("%s checkpoint input_dim mismatch" % arm)
-        return ck
+    @property
+    def selected_positions(self) -> Sequence[int]:
+        return self.spec.selected_positions
 
-    @staticmethod
-    def _check(state, expected, arm):
-        if set(state) != set(expected):
-            raise ValueError("Unexpected %s parameters: %s" % (arm, sorted(state)))
-        for name, shape in expected.items():
-            value = state[name]
-            if tuple(value.shape) != shape or not torch.isfinite(value).all():
-                raise ValueError("Invalid %s tensor: %s" % (arm, name))
+    def score(self, features: torch.Tensor) -> tuple[float, float]:
+        """features: [1, input_dim] 已按 checkpoint 声明顺序铺平。"""
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
+        if features.shape[-1] != self.input_dim:
+            raise ValueError(
+                "Feature dim %d != checkpoint input_dim %d"
+                % (features.shape[-1], self.input_dim)
+            )
+        if not torch.isfinite(features).all():
+            raise ValueError("Feature tensor contains non-finite values")
+        x = (features.float() - self.mean) / self.std
+        logit = float(self.module(x).reshape(-1)[0].item())
+        return logit, float(torch.sigmoid(torch.tensor(logit)).item())
 
-    def _build_linear(self, state):
-        self._check(state, {"0.weight": (1, self.input_dim), "0.bias": (1,)}, "Linear")
-        module = nn.Sequential(nn.Linear(self.input_dim, 1))
-        module.load_state_dict(state)
-        return module.eval()
+    def flatten(self, layer_blocks: Sequence[torch.Tensor]) -> torch.Tensor:
+        """按 checkpoint 声明的 flatten_order 组装特征向量。
 
-    def _build_mlp(self, state):
-        self._check(state, {"0.weight": (1024, self.input_dim), "0.bias": (1024,),
-                            "1.weight": (1024,), "1.bias": (1024,),
-                            "4.weight": (1, 1024), "4.bias": (1,)}, "N1024")
-        module = nn.Sequential(nn.Linear(self.input_dim, 1024), nn.LayerNorm(1024),
-                               nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, 1))
-        module.load_state_dict(state)
-        return module.eval()
+        layer_blocks: 每个元素是某层的 [n_pos, hidden]，顺序与 capture_layers 一致。
+        """
+        if len(layer_blocks) != len(self.capture_layers):
+            raise ValueError(
+                "Expect %d layer blocks, got %d"
+                % (len(self.capture_layers), len(layer_blocks))
+            )
+        order = list(self.spec.flatten_order or ["batch", "layer", "token", "hidden"])
+        if order != ["batch", "layer", "token", "hidden"]:
+            raise ValueError("Unsupported flatten_order: %r" % (order,))
+        stacked = torch.stack([b.float() for b in layer_blocks], dim=0)  # [layer, token, hidden]
+        return stacked.reshape(1, -1)
 
-    @torch.inference_mode()
-    def prepare_features(self, hidden):
-        """原始在线特征 → 训练缓存口径；不是缓存特征入口。"""
-        h = torch.as_tensor(hidden, dtype=torch.float32)
-        if tuple(h.shape) != self.feature_shape or not torch.isfinite(h).all():
-            raise ValueError("Expected finite %s raw features" % (self.feature_shape,))
-        # 原始采集是 bfloat16，缓存存储用 FP8 E5M2；不要用权重的 E4M3。
-        x = h.to(torch.bfloat16).to(torch.float8_e5m2).float().reshape(1, self.input_dim)
-        if not torch.isfinite(x).all():
-            raise ValueError("Non-finite features after E5M2 quantization")
-        return x
 
-    @torch.inference_mode()
-    def score(self, hidden):
-        x = self.prepare_features(hidden)
-        normalized = (x - self.mean) / self.std
-        logit = (self.blend_alpha * F.linear(normalized, self.linear[0].weight, self.linear[0].bias)
-                 + (1.0 - self.blend_alpha) * self.mlp(normalized)).item()
-        if not math.isfinite(logit):
-            raise ValueError("Non-finite blend logit")
-        return {"score": float(torch.sigmoid(torch.tensor(logit)).item()), "logit": logit,
-                "threshold": self.threshold, "threshold_logit": self.threshold_logit,
-                "flagged": logit >= self.threshold_logit}
+def _build_module(arch: str, state: dict, input_dim: int) -> nn.Module:
+    if arch == "linear":
+        expected = {"probe.weight": (1, input_dim), "probe.bias": (1,)}
+        flat = {
+            "0.weight": state["probe.weight"],
+            "0.bias": state["probe.bias"],
+        }
+    elif arch == "mlp":
+        expected = {"probe.weight": (1, input_dim), "probe.bias": (1,)}
+        flat = {"0.weight": state["probe.weight"], "0.bias": state["probe.bias"]}
+    else:
+        raise ValueError("Unsupported probe_architecture: %r" % (arch,))
+
+    for name, shape in expected.items():
+        if name not in state:
+            raise ValueError("Checkpoint missing tensor %r for arch %r" % (name, arch))
+        value = state[name]
+        if tuple(value.shape) != shape:
+            raise ValueError("Tensor %r shape %s != %s" % (name, tuple(value.shape), shape))
+        if not torch.isfinite(value).all():
+            raise ValueError("Tensor %r has non-finite values" % (name,))
+
+    module = nn.Sequential(nn.Linear(input_dim, 1))
+    module.load_state_dict(flat)
+    return module.eval()
+
+
+def load_probe(ckpt_path, *, expected_input_dim: int | None = None) -> Probe:
+    """从 checkpoint 文件构造探针，结构完全由 checkpoint 自描述。"""
+    path = Path(ckpt_path)
+    if not path.is_file():
+        raise ValueError("Probe checkpoint not found: %s" % path)
+
+    manifest = _read_manifest(path)
+    if manifest:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        declared = manifest.get("sha256")
+        if declared and declared != digest:
+            raise ValueError(
+                "Checkpoint sha256 mismatch: manifest=%s actual=%s" % (declared, digest)
+            )
+
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(ck, dict):
+        raise ValueError("Unsupported checkpoint layout: not a dict")
+
+    schema = ck.get("schema")
+    if schema not in SUPPORTED_SCHEMAS:
+        raise ValueError(
+            "Unsupported checkpoint schema %r; supported: %s"
+            % (schema, ", ".join(SUPPORTED_SCHEMAS))
+        )
+
+    state = ck.get("model_state_dict")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("Checkpoint has no model_state_dict")
+
+    arch = ck.get("probe_architecture") or "linear"
+    input_dim = int(ck.get("input_dim") or 0)
+    if input_dim <= 0:
+        raise ValueError("Checkpoint declares no usable input_dim")
+    if expected_input_dim is not None and input_dim != expected_input_dim:
+        raise ValueError(
+            "Checkpoint input_dim %d != expected %d" % (input_dim, expected_input_dim)
+        )
+
+    layers, semantics = _resolve_layers(ck, manifest)
+
+    positions = ck.get("selected_positions") or (manifest or {}).get("selected_positions")
+    if not positions:
+        raise ValueError("Checkpoint declares no selected_positions")
+    positions = tuple(int(x) for x in positions)
+
+    norm = ck.get("feature_normalization") or "standard"
+    if norm != "standard":
+        raise ValueError("Unsupported feature_normalization: %r" % (norm,))
+    if "input_mean" not in state or "input_std" not in state:
+        raise ValueError("Checkpoint missing input_mean/input_std for standard normalization")
+    mean = state["input_mean"].float().reshape(-1)
+    std = state["input_std"].float().reshape(-1)
+    if mean.numel() != input_dim or std.numel() != input_dim:
+        raise ValueError("Normalization tensors must be [%d]" % input_dim)
+    if not (torch.isfinite(mean).all() and torch.isfinite(std).all()) or not (std > 0).all():
+        raise ValueError("Invalid normalization tensors")
+
+    expected_layers = len(layers)
+    expected_pos = len(positions)
+    if input_dim != expected_layers * expected_pos * LAYER_HIDDEN:
+        raise ValueError(
+            "input_dim %d != layers(%d) x positions(%d) x hidden(%d)"
+            % (input_dim, expected_layers, expected_pos, LAYER_HIDDEN)
+        )
+
+    module = _build_module(arch, state, input_dim)
+
+    threshold = ck.get("threshold")
+    if threshold is None:
+        raise ValueError("Checkpoint declares no threshold")
+    threshold = float(threshold)
+
+    flatten_order = (manifest or {}).get("flatten_order") or ck.get("flatten_order")
+
+    spec = ProbeSpec(
+        path=str(path),
+        schema=schema,
+        probe_architecture=arch,
+        input_dim=input_dim,
+        block_indices=tuple(int(x) for x in (ck.get("selected_layer_indices") or ck.get("layer_indices") or ())),
+        capture_layers=layers,
+        selected_positions=positions,
+        feature_normalization=norm,
+        flatten_order=tuple(flatten_order) if flatten_order else ("batch", "layer", "token", "hidden"),
+        threshold=threshold,
+        labeling_protocol=ck.get("labeling_protocol"),
+        probe_prefix=(manifest or {}).get("probe_prefix"),
+        layer_semantics=semantics.value,
+        feature_name=ck.get("feature_name"),
+    )
+
+    return Probe(
+        path=path,
+        spec=spec,
+        module=module,
+        mean=mean,
+        std=std,
+        threshold=threshold,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
