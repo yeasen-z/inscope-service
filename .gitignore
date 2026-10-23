@@ -1,0 +1,30 @@
+# 权重与 checkpoint 不进仓库（公开仓库，权重要单独分发）
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+models/
+checkpoints/
+best.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地配置与密钥
+.env
+.env.*
+*.local
+
+# 运行产物
+*.log
+captures.pt
