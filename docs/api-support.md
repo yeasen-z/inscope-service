@@ -8,9 +8,9 @@
 
 ```text
 调用方 → 同一个 InScope Server
-          ├─ POST /detect   当前上下文评分
-          ├─ POST /audit    轨迹逐步审计（待实现）
-          └─ POST /analyze  指定 observation 内定位（批量协议待修）
+          ├─ POST /detect   当前上下文评分（单条/批量）
+          ├─ POST /audit    轨迹逐步审计
+          └─ POST /analyze  指定 observation 内相对归因
                          ↓
                   共享编排与探针评分
                          ↓
@@ -21,8 +21,8 @@
 
 | 路径 | 当前状态 | SDK |
 | --- | --- | --- |
-| POST /detect | 已注册；返回 logit、probability、threshold、label 等 | 同步/异步均有 detect |
-| POST /analyze | 已注册；有切分、组合评分和相对区域定位；真实 HTTP 批量请求体待修 | 尚无 analyze 方法，可直接调用 HTTP，但不能视为生产就绪 |
+| POST /detect | 已注册；默认接收批量消息并逐条隔离错误，兼容原单条格式 | 同步/异步均有 detect |
+| POST /analyze | 已注册；切分、组合评分与相对区域定位；真实引擎批量已验证 | 尚无 analyze 方法，可直接调用 HTTP |
 | POST /audit | 已注册；逐检查点回放，输出时间线与首次检出下标 | 同步/异步均有 audit |
 | GET /info | 返回当前探针和编排配置；没有完整功能支持列表 | 同步/异步均有 info |
 | GET /health/live | 仅进程存活，不需鉴权 | 无专用方法 |
@@ -36,9 +36,9 @@
 - detect/analyze 手动读取 Request 并做 Pydantic 校验，运行时有校验，但 OpenAPI 未声明 requestBody；200 响应 schema 也是空对象。自动生成客户端或看 Swagger 时，无法获得完整字段说明。
 - [schemas.py](<../inscope_contract/schemas.py>) 中 DetectionResult 仍要求 score、threshold_logit、flagged 等旧字段；当前 detect 返回 probability、label 等。该模型未绑定为路由 response_model，不能把它当当前真实响应契约。
 - analyze 有 AnalyzeRequest，没有相应的正式响应模型。SDK 尚未覆盖 analyze。
-- analyze 的请求级并发限制、异常映射和 HTTP 批量格式未闭环；详见 [代码导览](<architecture.md>)。
+- analyze 的请求级并发隔离与请求体读取的 deadline 边界仍未闭环；HTTP 批量协议已在真实引擎上验证通过。详见 [代码导览](<architecture.md>)。
 
-## 建议对齐的业务语义（尚未实现的部分不是接口承诺）
+## 业务语义（已实现部分的边界说明）
 
 ### detect：现在有没有达到探针阈值？
 
@@ -70,10 +70,10 @@
 
 ## 推荐补齐顺序
 
-1. 修正 HTTP 批量格式、模型身份校验失效策略、异常与并发边界，并补真实协议检查；不要通过切到现场 ZMQ 回避 HTTP 契约问题。
+1. 修正模型身份校验失效策略、异常与并发边界；不要通过切到现场 ZMQ 回避 HTTP 契约问题。
 2. 统一实际响应与 contract，补 OpenAPI 请求/响应描述；保持流式 body 大小限制和现有客户端兼容。
-3. 实现 audit 的轨迹截取与首次检出语义，复用 ScoringPipeline，不复制另一套探针逻辑。
+3. 加固 audit 的超长轨迹策略，复用 ScoringPipeline，不复制另一套探针逻辑。
 4. 补同步/异步 SDK 的 analyze/audit 及相应超时说明；可在 info 增加明确的 capabilities，避免调用方猜测功能是否存在。
 5. 分别验收三个业务入口。ready 单条打分通过不能替代批量或轨迹审计验收。
 
-本页是现状核对与补齐建议，不代表上述待实现功能已经发布。
+本页区分已实现能力与仍待补的边界；未列出的能力不代表已支持。

@@ -11,6 +11,7 @@
 | 引擎 | sglang-inscope `8a2998b`，Qwen3-8B-FP8，单卡（GPU 6） |
 | 引擎参数 | `--mem-fraction-static 0.75 --chunked-prefill-size 32768 --cuda-graph-bs-prefill 8192 16384 32768` |
 | 探针 | `best_layers_08_16_24.pt`，层 9/17/25，位置 -4..-1，threshold 0.9 |
+| profile 位置口径 | `position_mode=last`（`/info` 另报 `selected_positions=[-4,-3,-2,-1]`） |
 | profile | `a6_nemotron_risk_faced_v1` |
 | 网络 | 同机回环（服务与引擎均在本机） |
 

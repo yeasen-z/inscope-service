@@ -38,9 +38,11 @@ flowchart TB
 
 单次探测流程：**输入上下文 → Composer 编排 → 引擎提取特征 → 探针打分 → 返回结果**。业务调用方根据该探针的任务与标签定义解释结果，而不是由服务名称推断含义。
 
-代码职责、调用链和已知协议限制见 [代码导览](<docs/architecture.md>)。三个业务接口的现状与补齐顺序见 [多接口支持说明](<docs/api-support.md>)。真实环境下的延迟拆解与各接口实测数字见 [实测性能](<docs/performance.md>)。
+代码职责、调用链和已知限制见 [代码导览](<docs/architecture.md>)。三个业务接口的现状见 [多接口支持说明](<docs/api-support.md>)。真实环境下的延迟拆解与各接口实测数字见 [实测性能](<docs/performance.md>)。
 
-> 当前 `/analyze` HTTP 批量请求体仍有已确认的不匹配，CPU mock 测试不能替代真实引擎验收；不要将这条路径视为生产就绪。详见代码导览中的待修问题。
+> `/detect`、`/audit`、`/analyze` 三个业务接口均已在真实引擎（sglang-inscope + Qwen3-8B-FP8）与本机服务上跑通，
+> 特征采集协议与引擎的 `GenerateReqInput` 对齐。跑通不等于并发压测、检出率/误报率或训练侧数值一致性已验证，
+> 详见 [代码导览](<docs/architecture.md>) 的“尚未验收的部分”。
 
 ## 快速开始
 
@@ -140,7 +142,7 @@ async def main():
 asyncio.run(main())
 ```
 
-两种客户端均提供 `detect(messages, tools=None, request_id=None)`、`info()` 和 `ready()`。
+两种客户端均提供 `detect(messages, tools=None, request_id=None)`、`audit(messages, ...)`、`info()` 和 `ready()`；`/analyze` 目前需直接调用 HTTP。
 
 ## HTTP 接口
 
@@ -206,9 +208,9 @@ asyncio.run(main())
 | --- | --- | --- |
 | `observation_index` | 必填 | 要分析的 observation 在 `messages` 中的下标（0 起算） |
 | `granularity` | `paragraph` | 切分粒度：`paragraph` / `line` / `sentence`，单选，不自动跑三路 |
-| `mode` | `exact` | `exact` 精确枚举全部单元；`hierarchical` 组内精确再细化 |
+| `mode` | `auto` | `auto` 按单元数自适应（≤8 段 exact 全枚举，>8 段 hierarchical）；也可显式指定 `exact` / `hierarchical` |
 | `focus` | `high` | 找相对影响较高 / 较低的簇 |
-| `group_size` | `6` | 分层模式的组大小 |
+| `group_size` | `6` | 每层组数上限（2..8）；`auto` 会按段数改写并回报 `group_size_resolved` |
 | `max_coalitions` | `256` | 根组超预算报错；分层细化预算不足保留粗区间并标记限制 |
 
 返回的关键字段：
@@ -227,7 +229,7 @@ asyncio.run(main())
 - **颜色只是组内相对高低**，按当前组的 min/max 归一化；低分不代表安全，也没有绝对告警阈值。
 - `regions` 不连续，画成一段连续高亮就是错的；`resolution` 不是 `atomic` 时保留粗区间，不要画成精确边界。
 - 各层 `queries` 行数不能相加当模型请求数，相同文本会复用。
-- 与 `/detect` 共享编排和探针评分，采集走批量方法；`INSCOPE_ANALYZE_TIMEOUT`（默认 900 秒）限制分析阶段。请求体读取目前不在该 deadline 内。
+- 与 `/detect` 共享编排和探针评分，采集走批量方法；`INSCOPE_ANALYZE_TIMEOUT`（默认 900 秒）限制分析阶段。请求体读取目前不在该 deadline 内，也没有 analyze 请求级并发隔离。
 - 不静默截断输入，不将非有限分数或后端错误转成“未检出”。子层预算不足可返回粗区间；当前批量后端错误的 HTTP 映射仍需完善。
 - `cost.score_batches` 是算法评分轮数，不是 HTTP 次数；实际每桶最多 `INSCOPE_ANALYZE_BATCH` 份输入，各桶串行发送。
 
