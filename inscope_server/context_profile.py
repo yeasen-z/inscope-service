@@ -59,6 +59,8 @@ class ComposerProfile:
         }
         if self.composer is not None:
             payload["composer"] = self.composer.describe()
+        if "calibration_status" in self.invariants:
+            payload["calibration_status"] = self.invariants["calibration_status"]
         return payload
 
     def with_composer(self, composer: ComposerConfig) -> "ComposerProfile":
@@ -96,7 +98,10 @@ def _a6_nemotron_risk_faced_v1() -> ComposerProfile:
     featurize/settings/external_catalog_setting2.json：
       * 不加 probe_prefix（feature_name 即以 no_prefix 开头）；
       * 取最后 4 个 token（selected_positions = [-4,-3,-2,-1]）；
-      * 保留 CoT（discard_cots=False）。
+      * 保留 CoT（discard_cots=False）；
+      * 保留全部历史（retain_n_assistant_turns=-1），不是 A5 简化规则的
+        "开场 + 最近 N 个动作块"。审计时保留的是截至当前检查点的历史，
+        不包含未来消息。
     不要给这个探针加任何探测问题前缀，那会改变特征分布。
     """
     return ComposerProfile(
@@ -117,7 +122,21 @@ def _a6_nemotron_risk_faced_v1() -> ComposerProfile:
     )
 
 
+def _no_reasoning() -> ComposerProfile:
+    """A6 的显式消融策略；沿用权重，但尚未重新标定检测效果。"""
+    base = _a6_nemotron_risk_faced_v1()
+    return replace(
+        base,
+        profile_id="no_reasoning",
+        description="A6 experimental ablation: strip assistant reasoning and disable template thinking; not recalibrated.",
+        composer=replace(base.composer, discard_cots=True, enable_thinking=False),
+        invariants={**base.invariants, "discard_cots": True, "enable_thinking": False,
+                    "calibration_status": "experimental_not_recalibrated"},
+    )
+
+
 PROFILES = {
+    "no_reasoning": _no_reasoning,
     "a5_simplified_v1": _a5_simplified_v1,
     "a6_nemotron_risk_faced_v1": _a6_nemotron_risk_faced_v1,
 }

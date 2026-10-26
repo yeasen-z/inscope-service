@@ -38,6 +38,8 @@ flowchart TB
 
 单次探测流程：**输入上下文 → Composer 编排 → 引擎提取特征 → 探针打分 → 返回结果**。业务调用方根据该探针的任务与标签定义解释结果，而不是由服务名称推断含义。
 
+**现阶段的开发需求与上下游对接点，以 [统一设计文档](<docs/design.md>) 为准。**
+
 代码职责、调用链和已知限制见 [代码导览](<docs/architecture.md>)。三个业务接口的现状见 [多接口支持说明](<docs/api-support.md>)。真实环境下的延迟拆解与各接口实测数字见 [实测性能](<docs/performance.md>)。
 
 > `/detect`、`/audit`、`/analyze` 三个业务接口均已在真实引擎（sglang-inscope + Qwen3-8B-FP8）与本机服务上跑通，
@@ -94,6 +96,23 @@ inscope-serve --host 127.0.0.1 --port 8302
 
 可用 profile 及绑定条件见 [profile 注册表](<inscope_server/context_profile.py>)。启动自检成功不代表模型、引擎或整个检测链路已就绪；还需调用下面的就绪接口。
 
+#### 可选上下文策略：`no_reasoning`
+
+显式配置 `INSCOPE_COMPOSER_PROFILE=no_reasoning` 可选择 A6 的无 reasoning 消融策略：
+
+- 移除历史 assistant 的 `reasoning` / `reasoning_content`、thinking 内容块及 `<think>…</think>`（含未闭合块）。
+- 模板渲染使用 `enable_thinking=False`；模板仍可能输出空 thinking 控制标记，不保证文本完全不含标记。
+- 保留全部历史、可见回答、工具调用/结果；不清除 user/tool 正文里的同名标签，不添加探测前缀；仍采集最后四个 token。
+- 沿用 A6 探针权重及阈值，但**尚未重新标定**。响应 `composer.calibration_status` 为 `experimental_not_recalibrated`，不能据此宣称原策略的检测效果仍然成立。
+
+原 `a6_nemotron_risk_faced_v1` 策略不变。启动配置只决定默认值；detect/audit/analyze 的每次请求都可以用可选字段 `composer_profile` 覆盖：
+
+```json
+{"messages": [{"role": "user", "content": "..."}], "composer_profile": "no_reasoning"}
+```
+
+覆盖按请求隔离，不会改动默认值或并发请求；未知策略或不兼容当前探针的策略返回 422。批量的每条对话共用同一个 `composer_profile`（整批字段），响应里的 `composer_profile` 记录实际使用的策略。
+
 ### 4. 验证就绪并检测
 
 ```bash
@@ -142,7 +161,9 @@ async def main():
 asyncio.run(main())
 ```
 
-两种客户端均提供 `detect(messages, tools=None, request_id=None)`、`audit(messages, ...)`、`info()` 和 `ready()`；`/analyze` 目前需直接调用 HTTP。
+同步与异步客户端均提供 `detect(messages, tools=None, request_id=None)`、`detect_batch(messages, tools=None, request_id=None)`、`analyze(messages, observation_index, ...)`、`audit(messages, ...)`、`info()` 和 `ready()`。批量方法接收二维消息列表，结果按原输入顺序保留成功与失败项；不要忽略错误项。
+
+`detect` 返回继承共享 `DetectionResult` 的兼容型 `DetectResult`，`detect_batch` 返回共享 `DetectionBatchResult`。二者验证有限分数、概率范围和阈值标签一致性；批量还验证 count 与结果条数。analyze/audit/info 返回 JSON 对象，ready 返回布尔值。analyze/audit 支持客户端构造参数 `analyze_timeout=900` / `audit_timeout=1800` 和逐调用 `timeout`；客户端 HTTP 超时不等于服务端总 deadline。完整签名见 [SDK 实现](<inscope/client.py>)。
 
 ## HTTP 接口
 
@@ -153,7 +174,7 @@ asyncio.run(main())
 | GET | `/health/live` | 进程存活检查，不验证模型或引擎 |
 | GET | `/health/ready` | 实际运行检测链路，确认服务就绪 |
 | GET | `/info` | 查询当前探针、层号、位置、阈值和 Composer 配置 |
-| POST | `/detect` | 检测对话；请求包含 `messages`，可选 `tools` |
+| POST | `/detect` | 检测对话；`messages` 为单条消息列表或批量二维列表，可选 `tools` |
 | POST | `/audit` | 沿轨迹逐检查点评分，找出首次检出的步骤 |
 | POST | `/analyze` | 定位一条 observation 内影响评分的关键区间 |
 
@@ -168,11 +189,15 @@ asyncio.run(main())
 | `input_tokens` | Composer 实际输出的 token 数 |
 | `composer_profile` / `composer` | 使用的 profile ID 与编排配置 |
 | `checkpoint_sha256` | 权重文件摘要，用于追踪具体文件 |
-| `request_id` / `latency_ms` | 请求标识与服务端处理耗时 |
+| `request_id` / `latency_ms` | 请求标识与服务端处理耗时；`latency_ms` 在单风险模式是数字，多风险模式是含 `total` 的映射 |
 
 **当前接口仍有提示注入场景的历史命名**：`label` 使用 `attack` / `benign`，`risk` 固定为 `indirect_prompt_injection`。这些字段目前没有随探针任务动态变化，不能据此宣称服务已支持任意任务语义。接入其他任务时，需要同时适配输出标签与任务元信息；仅替换权重不会自动完成这一步。
 
-常见错误：`401` 鉴权失败、`413` 输入超限、`422` 输入不合法、`429` 并发已满、`503` 特征后端或打分异常、`504` 超时。超长输入会被拒绝，不会静默截断。
+常见错误：`401` 鉴权失败、`413` 输入超限、`422` 输入不合法、`429` 并发已满、`503` 特征后端或打分异常、`504` 超时。单条检测失败使用相应 HTTP 状态，不包装成 HTTP 200 的“阴性”。超长输入会被拒绝，不会静默截断。
+
+批量请求先检查外层结构及整批上限，再逐会话规范化、校验和隔离错误。完整批量响应为 `DetectionBatchResult`：`schema="inscope.detect_batch.v1"`、`count`、有序 `results` 与请求元数据；每项是共享 `DetectionResult` 或含 `error` / `detail` / `status_code` 的 `DetectionItemError`。HTTP 200 不表示所有项成功；整批请求本身的鉴权、大小、准入、结构或总超时失败仍可返回非 200。
+
+OpenAPI 声明 detect 单条/批量请求和共享 `DetectionResponse` 联合响应，以及 audit/analyze 的共享请求模型；audit/analyze 的完整响应模型仍在演进。契约细节见 [多接口支持说明](<docs/api-support.md>)。
 
 ### `/audit`：沿轨迹找首次检出
 
@@ -195,7 +220,9 @@ asyncio.run(main())
 `first_flagged_index` 表示"截至该步的累积上下文已越过阈值"，**不代表攻击在该步发生**，
 也不代表它导致了后续行为。这个边界写在响应的 `semantics` 字段里。
 
-各步上下文不同，无法合并成一批，因此 audit 走单条采集；并发由 `INSCOPE_AUDIT_CONCURRENCY` 控制。
+audit 按检查点串行推进并走单条采集，没有独立的 audit concurrency 配置。第 i 步先截取截至该步的轨迹，再按所选 profile 编排：A6 保留全部历史与 CoT；A5 简化规则会选窗。公共 token 前缀是否可复用取决于实际模板、选窗与引擎缓存，不能承诺每步只计算新增 token。
+
+若后续评分失败，即使此前已检出，整体仍为 `incomplete`，已有检出下标保留；不能只看 status 丢弃时间线信息。
 
 ### `/analyze`：定位影响评分的区间
 
@@ -229,8 +256,9 @@ asyncio.run(main())
 - **颜色只是组内相对高低**，按当前组的 min/max 归一化；低分不代表安全，也没有绝对告警阈值。
 - `regions` 不连续，画成一段连续高亮就是错的；`resolution` 不是 `atomic` 时保留粗区间，不要画成精确边界。
 - 各层 `queries` 行数不能相加当模型请求数，相同文本会复用。
-- 与 `/detect` 共享编排和探针评分，采集走批量方法；`INSCOPE_ANALYZE_TIMEOUT`（默认 900 秒）限制分析阶段。请求体读取目前不在该 deadline 内，也没有 analyze 请求级并发隔离。
-- 不静默截断输入，不将非有限分数或后端错误转成“未检出”。子层预算不足可返回粗区间；当前批量后端错误的 HTTP 映射仍需完善。
+- 与 `/detect` 共享编排和探针评分，采集走批量方法；`INSCOPE_ANALYZE_TIMEOUT`（默认 900 秒）限制整个分析请求，包含请求体读取。
+- detect（含整批）、audit、analyze、ready 共享请求级 `INSCOPE_MAX_INFLIGHT`；另由 `INSCOPE_BACKEND_MAX_INFLIGHT` 限制真实引擎 HTTP 在途请求。
+- 不静默截断输入，不将非有限分数或后端错误转成“未检出”；后端错误映射为 503，超时为 504。子层预算不足可返回粗区间；数值并列不能强行选出唯一高/低区域，单单元 auto 使用 exact 路径。
 - `cost.score_batches` 是算法评分轮数，不是 HTTP 次数；实际每桶最多 `INSCOPE_ANALYZE_BATCH` 份输入，各桶串行发送。
 
 ## 配置参考
@@ -238,20 +266,67 @@ asyncio.run(main())
 | 环境变量 | 必填 / 默认值 | 说明 |
 | --- | --- | --- |
 | `INSCOPE_MODEL_PATH` | 必填 | 本地模型与 tokenizer 目录 |
-| `INSCOPE_PROBE_CHECKPOINT` | 必填 | 探针权重文件路径 |
+| `INSCOPE_PROBE_CHECKPOINT` | 必填 | 主探针权重文件路径（风险代号见 `INSCOPE_PRIMARY_RISK`） |
+| `INSCOPE_PROBES` | 空 | 多风险额外探针：`risk=/path[,risk=/path]`，风险代号限 `harmful`/`prompt_leakage`/`ipi` |
+| `INSCOPE_PRIMARY_RISK` | `ipi` | 主探针在 `per_risk` 中的风险代号 |
+| `INSCOPE_DETECTOR_MODEL` | 模型标签 | 响应里 `detector_model` 的值，供下游核对探测器身份 |
 | `INSCOPE_COMPOSER_PROFILE` | 必填 | 已注册且与探针匹配的 profile ID |
 | `INSCOPE_API_KEY` | 必填 | 调用本服务的鉴权口令 |
 | `INSCOPE_ENGINE_URL` | `http://127.0.0.1:30000` | sglang-inscope 引擎地址 |
 | `SGLANG_API_KEY` | 空 | 引擎启用鉴权时使用，与本服务口令不同 |
 | `INSCOPE_MAX_INPUT_TOKENS` | `40959` | 输入 token 上限，可调小 |
-| `INSCOPE_MAX_INFLIGHT` | `16` | 检测及就绪检查的并发上限 |
-| `INSCOPE_REQUEST_TIMEOUT` | `60` | 检测及单次引擎请求超时，单位秒 |
-| `INSCOPE_ANALYZE_TIMEOUT` | `900` | 分析阶段总超时，单位秒 |
-| `INSCOPE_ANALYZE_BATCH` | `8` | 每个分析批次的 prompt 数上限，不是 GPU 并发数 |
-| `INSCOPE_AUDIT_TIMEOUT` | `1800` | 轨迹审计总超时，单位秒 |
-| `INSCOPE_AUDIT_CONCURRENCY` | `4` | 审计时同时在途的检查点数 |
+| `INSCOPE_MAX_BODY_BYTES` | `2097152` | HTTP 请求体字节上限，流式读取时限制 |
+| `INSCOPE_MAX_BATCH_ITEMS` | `128` | detect 整批会话条数上限，不是每桶大小 |
+| `INSCOPE_DETECT_BATCH` | `16` | detect 每桶 prompt 数上限，各桶串行 |
+| `INSCOPE_MAX_INFLIGHT` | `16` | detect/audit/analyze/ready 共享的外部请求并发上限 |
+| `INSCOPE_BACKEND_MAX_INFLIGHT` | `16` | 真实引擎 HTTP 在途请求上限，不是 GPU batch 大小 |
+| `INSCOPE_REQUEST_TIMEOUT` | `60` | detect/ready 总 deadline 及单次引擎请求超时，单位秒 |
+| `INSCOPE_ANALYZE_TIMEOUT` | `900` | 分析请求总 deadline，包含 body 读取，单位秒 |
+| `INSCOPE_ANALYZE_BATCH` | `8` | 分析每桶 prompt 数上限，各桶串行，不是 GPU 并发数 |
+| `INSCOPE_AUDIT_TIMEOUT` | `1800` | 串行轨迹审计请求总 deadline，包含 body 读取，单位秒 |
+
+每次真实后端 `/generate` 前都会 GET `/model_info` 检查模型身份，不保留永久 `_verified` 缓存。检查和采集是两个 HTTP 请求，仍有远端切换的竞态，不承诺原子身份保证。上述请求额度、HTTP 在途上限和分桶大小分别约束不同层次，均不能用于推断 GPU 同次 batch。
 
 HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为 `0.0.0.0:8302`；对外部署时应限制访问并在代理层配置 TLS。
+
+## 多风险：Probe Bank 兼容输出
+
+配置 `INSCOPE_PROBES` 后，`/detect` 会在同一次特征采集里对所有已加载探针打分，并在响应中追加 Probe Bank 风格字段：
+
+```json
+{
+  "per_risk": {"ipi": {"score": 0.97, "threshold": 0.9, "flagged": true},
+               "harmful": {"score": 0.12, "threshold": 0.5, "flagged": false}},
+  "per_entry": {"ipi": 0.97, "harmful": 0.12},
+  "triggered_entries": ["ipi"],
+  "enabled_risks": ["ipi", "harmful"],
+  "disabled_risks": ["prompt_leakage"],
+  "overall": true,
+  "profile": "balanced",
+  "detector_model": "<INSCOPE_DETECTOR_MODEL>",
+  "bank_version": "sha256:...",
+  "input_tokens": 37,
+  "latency_ms": {"total": 12.3}
+}
+```
+
+约束与事实：
+
+- **每个风险一份 checkpoint，层可以不同**。服务按运行时顺序取所有探针层号的并集，只发一次 `/generate`，各探针再从同一份特征里取自己的层；位置取并集后由后端按解析后的相对位置分组采集。`enabled_risks` 之外的风险只出现在 `disabled_risks`，**不会用别的 checkpoint 编造分数**。
+- **服务与调用方各自独立配置风险集合，按调用方请求取子集**。服务可以多加载；调用方用请求字段 `enabled_risks` 声明自己要哪些：
+
+  ```json
+  {"messages": [...], "enabled_risks": ["ipi"]}
+  ```
+
+  响应只包含这些风险，其余进 `disabled_risks`。请求了服务**未加载**的风险返回 `422`（不能伪造，也不能静默缺失）。省略该字段则返回全部已加载风险。
+- 阈值来自各自的 checkpoint，不共享主探针阈值；`per_risk[*].flagged` 是 `score >= threshold` 的布尔值。
+- `input_tokens`、`latency_ms.total`、`detector_model`、`bank_version` 均来自本次真实请求/权重摘要；`bank_version` 是全组参与打分的 checkpoint SHA-256 拼接后的前缀。
+- 未配置 `INSCOPE_PROBES` 且请求未声明 `enabled_risks` 时，响应保持原有扁平形态；多风险字段只是多出现，不改变既有字段语义。顶层 `probability` / `logit` / `label` **始终描述主探针**，全景看 `per_risk`。
+- 所有探针共享同一 Composer profile 与位置声明；位置不一致会在启动期直接失败，而不是静默错位。
+- `latency_ms` 在多风险模式下是映射（含 `total`），单风险模式仍是数字；SDK 两种都接受。
+- 多风险视图目前**只作用于 `/detect`**；`/audit` 与 `/analyze` 仍按主探针工作。
+- 与 CoolWatch 联调时，对方**只需要本服务的 URL 和 key**，不需要知道本服务跑的是哪个模型；`detector_model` 由本服务自述、对方原样展示。风险集合也不要求相等，其适配器会请求自己启用的子集并取交集。完整对接点见 [统一设计文档](<docs/design.md>)。
 
 ## 更换探针与上下文规则
 

@@ -43,8 +43,8 @@ def main(argv=None):
     logging.basicConfig(level=args.log_level.upper())
 
     # 提前校验配置，让缺项在启动前报出来，而不是首个请求时才炸。
-    settings = Settings.from_env()
     try:
+        settings = Settings.from_env()
         profile, probe = _preflight(settings)
     except (ValueError, OSError) as exc:
         log.error("启动自检失败: %s", exc)
@@ -65,7 +65,7 @@ def main(argv=None):
     # timeout_keep_alive 默认只有 5 秒：空闲一会儿就断，下次调用要重新握手。
     # 实测重建连接约多花 50ms，比检测本身还显眼，所以放宽到 75 秒
     # （高于常见负载均衡的 60 秒空闲超时，避免连接被两头同时掐断）。
-    uvicorn.run(create_app(settings), host=args.host, port=args.port,
+    uvicorn.run(create_app(settings, probe=probe), host=args.host, port=args.port,
                 log_level=args.log_level,
                 timeout_keep_alive=int(os.getenv("INSCOPE_KEEPALIVE", "75")))
     return 0

@@ -21,8 +21,8 @@ exact 需要枚举 2^n 个子集。默认预算 256 意味着 n>=9 必然超支�
     group_size 上限 6（2^6 = 64 组合/层），保证 256 预算至少能展开 4 层；
     若固定 8，单层就吃掉全部 256，第二层无预算可用，退化成"只做一次粗分"。
 
-调用方显式传 mode / group_size 时一律保留，不做改写——那时是调用方
-明确要求，服务不该替它改主意。
+显式 mode 保留；仅 mode="auto" 时，group_size（即使显式传入）也由服务
+按单元数与预算重新规划。显式 exact / hierarchical 时保留调用方的 group_size。
 """
 from .batching import bucket_by_length, make_batched_scorer, make_score_batch
 from .localization.api import analyze_observation
@@ -50,7 +50,8 @@ def plan_analysis(unit_count, max_coalitions=256):
         raise ValueError("max_coalitions must be >= 4")
     affordable = max_coalitions.bit_length() - 1
     if unit_count <= min(EXACT_UNIT_LIMIT, affordable):
-        size = min(unit_count, MAX_GROUP_SIZE)
+        # exact 不使用组数切分，但上游统一要求 group_size >= 2。
+        size = max(2, min(unit_count, MAX_GROUP_SIZE))
         return ("exact", size,
                 "%d units, 2^%d <= %d, full enumeration"
                 % (unit_count, unit_count, max_coalitions))

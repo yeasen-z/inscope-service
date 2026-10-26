@@ -1,4 +1,6 @@
 """Group-relative interval localization; no classification threshold."""
+from math import isclose
+
 from .attribution import shapley_values
 
 
@@ -15,7 +17,10 @@ def relative_split(entries, focus="high"):
                 'runner_up_gap': None, 'gap_ratio': None}
     gaps = [sign * (b['phi'] - a['phi']) for a, b in zip(ordered, ordered[1:])]
     largest = max(gaps)
-    positions = [i for i, gap in enumerate(gaps) if gap == largest]
+    # Only relative tolerance: an absolute epsilon would change decisions when
+    # the same effects are expressed at a different positive scale.
+    positions = [i for i, gap in enumerate(gaps)
+                 if isclose(gap, largest, rel_tol=1e-9, abs_tol=0.0)]
     if largest == 0 or len(positions) != 1:
         return {'status': 'no_unique_separation', 'selected_mask': 0, 'largest_gap': largest,
                 'runner_up_gap': None, 'gap_ratio': None}

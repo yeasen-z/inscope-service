@@ -47,7 +47,7 @@ def test_http_detect_batch_isolates_failures():
 
     scoring_module.ScoringPipeline.prepare = prepare
     try:
-        app = _http_app(lambda: (0.0, 0.5))
+        app = _http_app(lambda: (0.0, 0.5), allow_single_capture=True)
         # 让探针按内容区分好坏：正分=attack
         with TestClient(app) as client:
             response = client.post(
@@ -74,7 +74,7 @@ def test_http_detect_single_returns_input_tokens():
     from fastapi.testclient import TestClient
     from test_analyze import _http_app
 
-    app = _http_app(lambda: (1.0, 0.6))
+    app = _http_app(lambda: (1.0, 0.6), allow_single_capture=True)
     with TestClient(app) as client:
         response = client.post(
             "/detect", headers={"authorization": "Bearer k"},
@@ -90,7 +90,7 @@ def test_http_detect_batch_rows_carry_input_tokens():
     from fastapi.testclient import TestClient
     from test_analyze import _http_app
 
-    app = _http_app(lambda: (1.0, 0.6))
+    app = _http_app(lambda: (1.0, 0.6), allow_single_capture=True)
     with TestClient(app) as client:
         response = client.post(
             "/detect", headers={"authorization": "Bearer k"},

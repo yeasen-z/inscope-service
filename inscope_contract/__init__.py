@@ -46,7 +46,10 @@ from .constants import (
     THRESHOLD_SIGMOID,
     blend_arms,
 )
-from .schemas import AnalyzeRequest, AuditRequest, DetectionRequest, DetectionResult
+from .schemas import (
+    AnalyzeRequest, AuditRequest, DetectionRequest, DetectionResult,
+    DetectionBatchRequest, DetectionBatchResult, DetectionItemError, DetectionResponse,
+)
 from .layers import LayerSemantics, LayerSpec, build_layer_spec
 
 __all__ = [
@@ -57,6 +60,7 @@ __all__ = [
     "DEFAULT_PROBE_PREFIX", "DEFAULT_REQUEST_TIMEOUT", "DEFAULT_SEED",
     "DETECTION_RESPONSE_FIELDS", "DETECTOR_NAME", "RISK_TYPE", "AnalyzeRequest", "AuditRequest", "DetectionRequest", "DetectionResult",
     "DEFAULT_AUDIT_TIMEOUT", "DEFAULT_DETECT_BATCH",
+    "DetectionBatchRequest", "DetectionBatchResult", "DetectionItemError", "DetectionResponse",
     "ENDPOINTS", "FEATURE_ENCODING", "FEATURE_QUANTIZATION", "FEATURE_SHAPE",
     "INSCOPE_COMMIT", "INSCOPE_REPO", "INPUT_DIM", "LABELING_PROTOCOL", "LAYER_HIDDEN",
     "LayerSemantics", "LayerSpec", "build_layer_spec",

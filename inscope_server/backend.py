@@ -16,8 +16,12 @@ class BackendError(Exception):
     pass
 
 
-def decode_features(result, layers, positions):
-    """Never score missing, duplicate, wrong-position, or malformed captures."""
+def decode_features(result, layers, positions, by_position=False):
+    """Never score missing, duplicate, wrong-position, or malformed captures.
+
+    ``by_position=True`` 返回 ``{layer: {abs_position: [hidden]}}``，供各探针
+    按自己的位置子集取用；默认仍返回按请求顺序 stack 的 layer 列表。
+    """
     try:
         records = result["meta_info"]["features"]
         if not isinstance(records, list) or len(records) != len(layers):
@@ -37,6 +41,9 @@ def decode_features(result, layers, positions):
             if h.shape != tuple(expected_shape) or not torch.isfinite(h).all():
                 raise ValueError("Invalid feature data")
             by_layer[r["layer"]] = h
+        if by_position:
+            return {layer: {position: by_layer[layer][slot] for slot, position in enumerate(wanted)}
+                    for layer in layers}
         # 按请求的 layers 顺序 stack；不能依赖响应 records 的排列顺序。
         return [by_layer[layer] for layer in layers]
     except (KeyError, TypeError, ValueError, RuntimeError, OverflowError) as exc:
@@ -51,15 +58,15 @@ class InScopeBackend:
         self.client = client or httpx.AsyncClient(
             base_url=settings.backend_url, headers=headers, timeout=settings.timeout,
             limits=httpx.Limits(max_connections=settings.max_inflight + 1), trust_env=False)
-        self._verified = False
+        self._slots = asyncio.Semaphore(getattr(settings, "backend_max_inflight", settings.max_inflight))
 
-    async def capture(self, ids, layers, positions=None):
+    async def capture(self, ids, layers, positions=None, *, by_position=False):
         if len(ids) < 1:
             raise BackendError("Capture requires at least one prompt token")
-        results = await self.capture_batch([ids], layers, positions)
+        results = await self.capture_batch([ids], layers, positions, by_position=by_position)
         return results[0]
 
-    async def capture_batch(self, batch_ids, layers, positions=None):
+    async def capture_batch(self, batch_ids, layers, positions=None, *, by_position=False):
         """一次 /generate 取回多份 prompt 的层特征，按输入顺序返回。
 
         批量协议（已用真实引擎验证）：
@@ -78,7 +85,6 @@ class InScopeBackend:
             raise BackendError("Capture requires at least one prompt token per request")
         try:
             async with asyncio.timeout(self.settings.timeout):
-                await self._verify_model()
                 active = tuple(int(layer) for layer in layers)
                 wanted = tuple(int(p) for p in (positions or SELECTED_POSITIONS))
                 groups = {}
@@ -90,24 +96,31 @@ class InScopeBackend:
                     groups.setdefault(index, []).append(position)
                 if len(groups) == 1:
                     only = next(iter(groups))
-                    return await self._capture_group(batch, active, only)
+                    return await self._capture_group(batch, active, only, by_position)
                 # 位置不同无法合并成一批，逐组并发后按原顺序还原。
                 async def run(index, members):
                     return index, await self._capture_group(
-                        [batch[m] for m in members], active, index)
+                        [batch[m] for m in members], active, index, by_position)
 
                 results = [None] * len(batch)
-                for index, features in await asyncio.gather(
-                        *(run(i, m) for i, m in groups.items())):
-                    for slot, position in enumerate(groups[index]):
-                        results[position] = features[slot]
-                return results
+                tasks = [asyncio.create_task(run(i, m)) for i, m in groups.items()]
+                try:
+                    for index, features in await asyncio.gather(*tasks):
+                        for slot, position in enumerate(groups[index]):
+                            results[position] = features[slot]
+                    return results
+                finally:
+                    # 一组失败/调用方取消时，回收其余组而不是遗留后台请求。
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
         except (httpx.TimeoutException, TimeoutError):
             raise TimeoutError("SGLang request timed out") from None
         except (httpx.HTTPError, ValueError) as exc:
             raise BackendError("SGLang unavailable or returned invalid JSON") from exc
 
-    async def _capture_group(self, batch, active, index):
+    async def _capture_group(self, batch, active, index, by_position=False):
         """对共享同一采集位置的一组 prompt 发一次批量 /generate。"""
         payload = {
             "input_ids": batch if len(batch) > 1 else batch[0],
@@ -116,22 +129,23 @@ class InScopeBackend:
                                 "positions": {"mode": "explicit", "index": list(index)},
                                 "encoding": "float_list"},
         }
-        response = await self.client.post("/generate", json=payload)
-        response.raise_for_status()
-        body = response.json()
+        async with self._slots:
+            # 每次采集前重新核验，远端重启/换模型后不沿用永久缓存。
+            await self._verify_model()
+            response = await self.client.post("/generate", json=payload)
+            response.raise_for_status()
+            body = response.json()
         items = body if isinstance(body, list) else [body]
         if len(items) != len(batch):
             raise BackendError("Batch response does not match %d requests" % len(batch))
-        return [decode_features(item, active, index) for item in items]
+        return [decode_features(item, active, index, by_position) for item in items]
 
     async def _verify_model(self):
-        """首次请求校验模型身份；结果缓存到本实例关闭。
+        """每次 /generate 前验证身份，不缓存跨重启的验证结果。
 
-        注意：HTTP 连接重建或远端引擎重启不会清除 _verified。
-        当前不能据此保证运行期间模型未被替换；修复缓存策略需单独验证。
+        这不能阻止核验与采集之间的远端热切换；部署仍应固定模型，
+        不在有在途请求时修改引擎权重。
         """
-        if self._verified:
-            return
         info_response = await self.client.get("/model_info")
         info_response.raise_for_status()
         info = info_response.json()
@@ -145,8 +159,6 @@ class InScopeBackend:
                 or (info.get("tokenizer_path") and
                     str(Path(info["tokenizer_path"]).resolve()) != model_path)):
             raise BackendError("SGLang model/tokenizer differs from MODEL_PATH")
-        self._verified = True
 
     async def close(self):
-        self._verified = False
         await self.client.aclose()

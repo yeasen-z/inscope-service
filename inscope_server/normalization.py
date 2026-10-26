@@ -136,6 +136,8 @@ def split_detect_payload(payload):
 
     默认批量：``messages`` 为二维列表即多条；一维列表视为单条，
     保持旧调用方不受影响。``tools`` 由整批共享（同一套工具定义）。
+    ``composer_profile`` 可选，覆盖本次请求的默认编排策略。
+    ``enabled_risks`` 可选，只返回这些风险（由服务端与已加载集合求交集校验）。
     """
     if not isinstance(payload, dict):
         raise ValueError("body must be an object")
@@ -145,13 +147,24 @@ def split_detect_payload(payload):
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a non-empty list")
     tools = payload.get("tools")
-    extra = set(payload) - {"messages", "tools"}
+    composer_profile = payload.get("composer_profile")
+    enabled_risks = payload.get("enabled_risks")
+    extra = set(payload) - {"messages", "tools", "composer_profile", "enabled_risks"}
     if extra:
         raise ValueError("unexpected fields: %s" % ", ".join(sorted(extra)))
+    if composer_profile is not None and (not isinstance(composer_profile, str) or not composer_profile):
+        raise ValueError("composer_profile must be a non-empty string")
+    if enabled_risks is not None:
+        if (not isinstance(enabled_risks, list) or not enabled_risks
+                or any(not isinstance(risk, str) or not risk for risk in enabled_risks)
+                or len(set(enabled_risks)) != len(enabled_risks)):
+            raise ValueError("enabled_risks must be a non-empty list of unique risk names")
     # 二维（元素是列表）→ 批量；否则单条
     if all(isinstance(item, list) for item in messages):
-        requests = [{"messages": item, "tools": tools} for item in messages]
+        requests = [{"messages": item, "tools": tools, "composer_profile": composer_profile,
+                     "enabled_risks": enabled_risks} for item in messages]
         return requests, tools, True
     if any(isinstance(item, list) for item in messages):
         raise ValueError("messages is neither a single message list nor a batch")
-    return [{"messages": messages, "tools": tools}], tools, False
+    return [{"messages": messages, "tools": tools, "composer_profile": composer_profile,
+             "enabled_risks": enabled_risks}], tools, False

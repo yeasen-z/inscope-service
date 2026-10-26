@@ -112,11 +112,12 @@ ENDPOINTS = {
     "ready": "/health/ready",
 }
 
-# /detect 与 /info 必须返回的字段；改名会破坏调用方。
+# /detect 成功结果的必需字段；与 DetectionResult 保持一致。
+# composer / normalization 是可选元数据；flagged 仅为 SDK 便捷属性。
 DETECTION_RESPONSE_FIELDS = (
-    "score", "logit", "threshold", "threshold_logit", "flagged", "risk",
-    "model", "normalization", "checkpoint_sha256", "input_tokens",
-    "request_id", "latency_ms", "setting", "detector_seed",
+    "probability", "logit", "threshold", "label", "risk", "model",
+    "input_tokens", "request_id", "latency_ms", "composer_profile",
+    "checkpoint_sha256",
 )
 
 # --- engine（sglang fork）-----------------------------------------------

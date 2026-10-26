@@ -1,9 +1,11 @@
-# 多接口支持现状与补齐顺序
+# 多接口支持与契约边界
+
+> 现状、上下游对接点与待办需求见 [统一设计文档](design.md)。
 
 ## 对外接口和内部引擎接口不要混淆
 
 调用方访问同一个 InScope Server 地址上的多个业务路径；不需要每个功能单独启动服务。
-当前一个服务实例共享一个已加载探针、一个匹配 profile 和一个后端客户端。
+一个实例共享一个已加载探针、一个匹配 profile 和一个后端客户端。
 多业务接口不等于同时加载多个探针，也不要求引擎暴露 detect/audit/analyze。
 
 ```text
@@ -14,66 +16,67 @@
                          ↓
                   共享编排与探针评分
                          ↓
-                 sglang-inscope /generate
+              sglang-inscope /model_info + /generate
 ```
 
-## 当前支持表
+## 支持表
 
-| 路径 | 当前状态 | SDK |
+| 路径 | 行为 | 同步 / 异步 SDK |
 | --- | --- | --- |
-| POST /detect | 已注册；默认接收批量消息并逐条隔离错误，兼容原单条格式 | 同步/异步均有 detect |
-| POST /analyze | 已注册；切分、组合评分与相对区域定位；真实引擎批量已验证 | 尚无 analyze 方法，可直接调用 HTTP |
-| POST /audit | 已注册；逐检查点回放，输出时间线与首次检出下标 | 同步/异步均有 audit |
-| GET /info | 返回当前探针和编排配置；没有完整功能支持列表 | 同步/异步均有 info |
+| POST /detect | 兼容单条消息列表；二维 messages 为批量，逐项隔离错误 | `detect` / `detect_batch` |
+| POST /analyze | 切分、组合评分与相对区域定位 | `analyze` |
+| POST /audit | 串行逐检查点回放，输出时间线与首次检出下标 | `audit` |
+| GET /info | 返回当前探针和编排配置 | `info` |
 | GET /health/live | 仅进程存活，不需鉴权 | 无专用方法 |
-| GET /health/ready | 使用单条采集路径做真实打分；不能证明 analyze 批量就绪 | 同步/异步均有 ready |
+| GET /health/ready | 使用单条采集路径做真实打分；不能证明所有批量与审计场景就绪 | `ready` |
 
-业务接口、info 和 ready 需要 Bearer key。接口实现见 [app.py](<../inscope_server/app.py>)，SDK 见 [client.py](<../inscope/client.py>)。
+业务接口、info 和 ready 需要 Bearer key。实现见 [app.py](<../inscope_server/app.py>)，SDK 见 [client.py](<../inscope/client.py>)。
 
-## 核对发现
+## 共享契约与错误语义
 
-- audit 已补齐：路由、`AuditRequest` 契约、同步/异步 SDK。检查点默认取 tool/user 观察，只回放截至该步的上下文。
-- detect/analyze 手动读取 Request 并做 Pydantic 校验，运行时有校验，但 OpenAPI 未声明 requestBody；200 响应 schema 也是空对象。自动生成客户端或看 Swagger 时，无法获得完整字段说明。
-- [schemas.py](<../inscope_contract/schemas.py>) 中 DetectionResult 仍要求 score、threshold_logit、flagged 等旧字段；当前 detect 返回 probability、label 等。该模型未绑定为路由 response_model，不能把它当当前真实响应契约。
-- analyze 有 AnalyzeRequest，没有相应的正式响应模型。SDK 尚未覆盖 analyze。
-- analyze 的请求级并发隔离与请求体读取的 deadline 边界仍未闭环；HTTP 批量协议已在真实引擎上验证通过。详见 [代码导览](<architecture.md>)。
+[schemas.py](<../inscope_contract/schemas.py>) 是请求与检测响应的共同来源：
 
-## 业务语义（已实现部分的边界说明）
+- `DetectionResult` 表示成功结果：有限的 logit/probability/threshold、合法标签、token 数与追踪元数据。probability 和 threshold 在 [0,1]，label 必须与阈值比较一致。
+- `DetectionBatchResult` 表示有序批量结果，包含 `schema="inscope.detect_batch.v1"`、`count`、`results` 和请求元数据；`count` 必须等于结果条数。
+- `results` 每项是 `DetectionResult` 或 `DetectionItemError`；错误项有 `error`、`detail`、`status_code`，不是带零分的成功项。
+- 单条失败使用 HTTP `413`（输入超限）、`422`（输入不合法）、`503`（后端/打分失败）、`504`（超时）。鉴权失败为 `401`，共享请求并发额度耗尽为 `429`。
+- 批量在整批请求结构与上限校验后，对各会话分别规范化和校验；某一项无效不阻止其他项评分。已完成的批量响应为 HTTP 200，逐项检查 `status_code`，不能将失败项当作 benign。整批 body 超限、条数超限、非法外层结构、鉴权、准入或整体 deadline 失败仍可返回非 200。
+
+OpenAPI 声明 detect 的单条/批量 requestBody 和 `DetectionResponse` 联合响应；audit/analyze requestBody 引用共享模型。audit/analyze 的完整响应模型仍在演进，不能据此承诺已能生成全部强类型客户端。
+
+两种 SDK 均提供 detect/detect_batch/analyze/audit/info/ready。`detect` 返回兼容型 `DetectResult`（继承共享模型并保留旧服务元数据默认值），`detect_batch` 返回共享 `DetectionBatchResult`；`flagged` 是结果上的便利属性，不是独立 wire 字段。analyze/audit/info 返回 JSON 对象，ready 返回布尔值。传输、非 200 和畸形成功响应不会被当作检测阴性。analyze/audit 分别有 `analyze_timeout`（默认 900 秒）和 `audit_timeout`（默认 1800 秒），也可逐调用传入 `timeout`；这是客户端 HTTP 超时，不替代服务端总 deadline。
+
+## 资源、超时与身份检查
+
+- detect（含整批）、audit、analyze 和 ready 共享 `INSCOPE_MAX_INFLIGHT` 请求额度，每个外部请求占一份；audit 的内部检查点不会重复占用请求槽。
+- `INSCOPE_BACKEND_MAX_INFLIGHT` 另行限制真实引擎 HTTP 在途请求，不等于请求数、桶大小或 GPU batch 大小。
+- body 流式大小限制与读取均在业务请求 deadline 内；detect/ready 使用 request timeout，audit/analyze 使用各自总 timeout。引擎单次请求仍受 request timeout 限制。
+- `INSCOPE_MAX_BATCH_ITEMS=128` 是 detect 整批条数上限，`INSCOPE_DETECT_BATCH=16` 是每桶上限；analyze 每桶默认 8。桶串行发送，不承诺引擎 GPU 同次 forward。
+- 每次真实引擎 `/generate` 前读取 `/model_info` 核验模型身份，不使用永久 `_verified` 缓存。但检查与采集是两个请求，存在远端切换的竞态，不保证原子性。
+
+配置明细见 [README](<../README.md#配置参考>)，实现边界见 [代码导览](<architecture.md>)。
+
+## 业务语义
 
 ### detect：现在有没有达到探针阈值？
 
-输入 messages/tools；保持现有分数、阈值及 label。若演示端需要 exists，可显式约定其与阈值判定的关系，不删除已有 label 或静默换字段。
+输入 messages/tools，返回分数、阈值及 label。若业务需要 exists，可显式约定与阈值判定的关系，不静默换字段。`attack` / `benign` 和固定 risk 是当前接口的历史命名，并不让任意探针自动具有相同业务语义。
 
-### audit：首次在哪一步检出？（已实现）
+配置 `INSCOPE_PROBES` 后，同一次特征采集会为所有已加载探针打分，响应追加 `per_risk`/`per_entry`/`triggered_entries`/`enabled_risks`/`disabled_risks`/`overall`/`profile`/`detector_model`/`bank_version`，且 `latency_ms` 变为含 `total` 的映射。顶层 `probability`/`logit`/`label` 仍来自主探针，语义不变。未注册的风险只出现在 `disabled_risks`，不会得到伪造分数。该视图目前只作用于 `/detect`，`/audit`、`/analyze` 仍按主探针工作。
 
-沿轨迹检查点逐步回放，第 i 步只用 `messages[:i+1]`，绝不带入未来消息。
-每个检查点独立评分，并发受 `inscope_audit_concurrency` 约束但仍按轨迹顺序报告。
+### audit：首次在哪一步检出？
 
-返回：`steps` 时间线、`first_flagged_index`、`flagged_indices`、`failed_at`。
+第 i 个检查点只用 `messages[:i+1]`，绝不带入未来消息；检查点串行评分，按轨迹顺序返回 `steps`、`first_flagged_index`、`flagged_indices`、`failed_at`。没有 audit concurrency 配置。
 
-三种"没检出"必须区分：
+三种状态必须区分：
 - `clear`：所有检查点都跑完且都低于阈值；
-- `incomplete`：有检查点没跑或失败——**不是阴性**；
-- `flagged`：至少一步越过阈值。
+- `incomplete`：有检查点没跑或失败，**不是阴性**；
+- `flagged`：完整评分后至少一步越过阈值。若后续检查点失败，即使已有检出，整体仍为 incomplete，已检出下标仍保留。
 
-`first_flagged_index` 表示"截至该步的累计上下文已越过阈值"，不代表攻击在该步发生，
-也不代表该步导致后续行为。响应里的 `semantics` 字段把这个边界写给调用方。
-
-上线前仍需确认：超长轨迹的 token 上限策略（当前受 `INSCOPE_MAX_INPUT_TOKENS` 与 128 条消息约束）、
-以及探针 composer 的选窗是否会裁掉早期检查点。
+首次检出表示“截至该步的累计上下文已越过阈值”，不代表攻击在该步发生或导致后续行为。实际模型输入仍遵守所选 profile：A6 保留截至该步的全部历史与 CoT；A5 简化规则会选窗。128 条消息约束、token 上限和 profile 规则须共同检查，超限不静默截断。
 
 ### analyze：所选 observation 中哪些片段相对影响分数？
 
-保持现有 observation_index、粒度、模式、预算；返回不连续 regions、原文偏移、levels 和不确定状态。
-不必强制先调用 detect/audit；已有 observation_index 的调用方可以直接分析。
-定位是相对归因，不是片段绝对恶意性的判决。
+保留 observation_index、粒度、模式、预算；返回可能不连续的 regions、原文偏移、levels 和不确定状态。无需先调用 detect/audit。定位是相对归因，不是片段绝对恶意性的判决。
 
-## 推荐补齐顺序
-
-1. 修正模型身份校验失效策略、异常与并发边界；不要通过切到现场 ZMQ 回避 HTTP 契约问题。
-2. 统一实际响应与 contract，补 OpenAPI 请求/响应描述；保持流式 body 大小限制和现有客户端兼容。
-3. 加固 audit 的超长轨迹策略，复用 ScoringPipeline，不复制另一套探针逻辑。
-4. 补同步/异步 SDK 的 analyze/audit 及相应超时说明；可在 info 增加明确的 capabilities，避免调用方猜测功能是否存在。
-5. 分别验收三个业务入口。ready 单条打分通过不能替代批量或轨迹审计验收。
-
-本页区分已实现能力与仍待补的边界；未列出的能力不代表已支持。
+单单元 auto 使用可处理该输入的 exact 路径；数值并列不能武断选出唯一高/低区间，非有限探针分数必须报错，不能伪装成未检出。真实引擎批量协议已跑通，但历史性能快照不是当前身份校验、并发或准确性验收，见 [实测性能](<performance.md>)。

@@ -221,8 +221,12 @@ def _http_app(probe_score, batch_calls=None, allow_single_capture=False):
                     "analyze must use capture_batch; per-prompt capture defeats batching")
             return [torch.zeros((len(positions), 4))]
 
-        async def capture_batch(self, batch_ids, layers, positions):
+        async def capture_batch(self, batch_ids, layers, positions, *, by_position=False):
             recorded.append(len(batch_ids))
+            blocks = [torch.zeros((len(positions), 4)) for _ in layers]
+            if by_position:
+                return [{layer: {pos: block[i] for i, pos in enumerate(positions)}
+                         for layer, block in zip(layers, blocks)} for _ in batch_ids]
             return [[torch.zeros((len(positions), 4))] for _ in batch_ids]
 
         async def close(self):
@@ -599,3 +603,54 @@ def test_http_analyze_ten_paragraphs_auto_degrades():
     assert body["mode_resolved"] == "hierarchical"
     assert body["group_size_resolved"] == 6
     assert "4 layers" in body["mode_reason"]
+
+
+# ---------------------------------------------------- boundary regressions
+def test_auto_single_unit_keeps_valid_group_size():
+    from inscope_server.analyze import plan_analysis
+
+    request = {"messages": [{"role": "tool", "content": "One paragraph."}]}
+    batch = make_score_batch(lambda request: {"logit": 0.0})
+    result = asyncio.run(analyze_observation(request, 0, batch, mode="auto"))
+    assert plan_analysis(1)[:2] == ("exact", 2)
+    assert result["mode_resolved"] == "exact"
+    assert result["group_size_resolved"] == 2
+    assert result["status"] == "insufficient_comparison"
+    assert result["cost"]["coalitions"] == 2
+
+
+def test_http_auto_single_unit_returns_200():
+    app = _http_app(lambda: (0.0, 0.5))
+    replay = _replay()
+    replay["messages"][2]["content"] = "One paragraph."
+    with TestClient(app) as client:
+        response = client.post(
+            "/analyze", headers={"authorization": "Bearer k"},
+            json={"messages": replay["messages"], "observation_index": 2})
+    assert response.status_code == 200, response.text
+    assert response.json()["group_size_resolved"] == 2
+
+
+@pytest.mark.parametrize("focus", ["high", "low"])
+@pytest.mark.parametrize("scale", [1e-12, 0.1, 1.0, 10.0, 1e12])
+def test_relative_split_preserves_tied_gaps_under_scaling(focus, scale):
+    from inscope_server.localization.localization import relative_split
+
+    # Decimal arithmetic creates slightly unequal float gaps despite equal spacing.
+    entries = [{"index": i + 1, "phi": value * scale}
+               for i, value in enumerate([0.1, 0.2, 0.3])]
+    split = relative_split(entries, focus)
+    assert split["status"] == "no_unique_separation"
+    assert split["selected_mask"] == 0
+
+
+@pytest.mark.parametrize("focus,expected", [("high", 4), ("low", 3)])
+@pytest.mark.parametrize("scale", [1e-12, 1.0, 1e12])
+def test_relative_split_preserves_distinct_gaps_under_scaling(focus, expected, scale):
+    from inscope_server.localization.localization import relative_split
+
+    entries = [{"index": i + 1, "phi": value * scale}
+               for i, value in enumerate([0.0, 1.0, 4.0])]
+    split = relative_split(entries, focus)
+    assert split["status"] == "separated"
+    assert split["selected_mask"] == expected

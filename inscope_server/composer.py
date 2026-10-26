@@ -143,6 +143,13 @@ def _normalize_prompt_message(message: Mapping[str, Any], *, discard_cots: bool)
         source = dict(source)
         source["content"] = re.sub(r"<think>.*?</think>\s*", "", source["content"], flags=re.DOTALL)
     normalized = normalize_chat_message(source)
+    if discard_cots and message.get("role") == "assistant":
+        # normalize_chat_message 也会从内容块/内联标签提取 reasoning；
+        # 因此必须在规范化后再次移除，含未闭合的历史思考块。
+        normalized.pop("reasoning", None)
+        normalized.pop("reasoning_content", None)
+        normalized["content"] = re.sub(
+            r"<think>.*?(?:</think>|$)\s*", "", normalized["content"], flags=re.DOTALL)
     if not discard_cots and "reasoning_content" not in normalized and "reasoning" in normalized:
         normalized["reasoning_content"] = normalized["reasoning"]
     tool_calls = _normalize_tool_calls(source.get("tool_calls"))

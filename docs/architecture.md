@@ -1,5 +1,7 @@
 # 代码导览与实现边界
 
+> 现状、上下游对接点与待办需求见 [统一设计文档](design.md)；本文只回答“代码在哪、调用链怎么走”。
+
 ## 从哪里开始读
 
 三个顶层包保持原样，不为了目录整齐破坏 SDK 导入路径：
@@ -28,7 +30,11 @@
 | [normalization.py](<../inscope_server/normalization.py>) | 保守的请求形状规范化 | 猜测缺失历史和 tool-call ID |
 | [config.py](<../inscope_server/config.py>)、[cli.py](<../inscope_server/cli.py>) | 部署配置、预检和启动 | 训练 |
 
-## 两条调用链
+## 共享入口与三条调用链
+
+所有业务请求先通过共享请求级 `max_inflight` 准入，detect（含整批）、audit、analyze 和 ready 使用同一个额度。body 的流式大小限制、读取、校验和业务处理位于对应请求 deadline 内；审计/分析使用独立总超时，真实引擎单次请求仍受 request timeout 约束。另一个 `backend_max_inflight` 限制实际引擎 HTTP 在途数，不能与外部请求数、每桶大小或 GPU 并发混同。
+
+单条 detect 错误返回 HTTP 413/422/503/504。批量先校验外层和 `max_batch_items`，再逐会话 normalize + 校验，保留原顺序并隔离失败；失败项包含 `status_code`，不是零分阴性。成功响应使用共享 `DetectionResult` / `DetectionBatchResult`，OpenAPI 的 `DetectionResponse` 为二者联合；audit/analyze 仅共享请求模型，完整响应模型仍在演进。
 
 ```text
 /detect
@@ -41,7 +47,7 @@
 /audit
   → 规范化与校验
   → 按检查点串行回放 messages[:i+1]
-      → ScoringPipeline.capture（单条采集，相邻窗口命中引擎前缀缓存）
+      → ScoringPipeline.capture（单条采集，实际公共 token 前缀可能复用缓存）
   → 时间线、首次检出下标与 semantics
 
 /analyze
@@ -57,6 +63,7 @@
 
 三个接口共享编排和 `score_features`，但采集分别走单条/批量方法。
 不要说 analyze 调用了 detect 路由，也不要说它们都经过 `score_ids`。
+`/detect` 单条在多风险模式下改走 `ScoringPipeline.collect`（内部 `backend.capture`），批量仍走 `score_prompts`（`backend.capture_batch`），两者共享 `score_probes_all`。
 打分流水线暂时保留 FastAPI 错误映射，尚不是与传输完全解耦的领域层。
 
 ## 分析究竟如何工作
@@ -68,6 +75,7 @@
 5. 用每份文本的 logit 算精确组内 Shapley，并比较相对影响；不是绝对安全/危险判决。
 6. exact 枚举全部选定单元；hierarchical 先比较粗组，再细化被选中区域。后续层依赖前层结果，不能一次全部提前提交。
 7. 根组超预算报错；子组预算不足时保留粗区域并标记 `budget_limited`，不是一律抛错。
+8. 单单元 auto 走 exact；数值并列用容差判断，不强行选出唯一高/低区域。探针归一化参数、权重和输出的非有限数值不能静默进入定位或变成“未检出”。
 
 同一轮可批量评分，不同轮有依赖。`cost.score_batches` 是算法调用评分器的轮数，不是 HTTP 次数。
 当前评分器不返回 `prompt_index`，所以 `model_requests` 为 null，不能据此宣称已检测最终 token 输入坍缩。
@@ -83,19 +91,19 @@
 
 `capture_batch` 发送单个对象，`input_ids` 为二维列表，`feature_capture` 为该批共用的一个 spec，
 与引擎 `GenerateReqInput` 对齐。由于 spec 整批共享，负向位置会按各 prompt 自身长度解析成不同的绝对下标，
-因此实现按“解析后的位置”分组、逐组并发，最后按输入顺序拼回，避免拿 A 的位置读 B 的序列。
+因此实现按“解析后的位置”分组、串行发送各组，最后按输入顺序拼回，避免拿 A 的位置读 B 的序列。评分层的长度桶也串行执行；detect 每桶默认 16 条、整批最多默认 128 条，analyze 每桶默认 8 条，这些都不是 GPU batch 大小。
 
 已在真实引擎（sglang-inscope + Qwen3-8B-FP8）上验证：两条等长 prompt 合并为一次请求，
-返回 2 份记录、各 3 层 × 4 位置、`bfloat16`、形状 `(4, 4096)`，两份数值不同（未串行）。
+返回 2 份记录、各 3 层 × 4 位置、`bfloat16`、形状 `(4, 4096)`，两份数值不同。该结果验证 HTTP 批量收发与记录区分，不证明请求在 GPU 上同次 forward，也不证明不存在引擎内部串行。
 协议改动须同时更新 mock 与真实引擎检查，不能只改 mock 让结果变绿。
 
-### 已知限制（仍在）
+### 身份检查、配置与仍存边界
 
-- **模型身份缓存不随远端重启失效。** `_verified` 缓存至本实例关闭，HTTP 重连不会重新校验身份。
-- **分析资源与异常边界不完整。** analyze 尚无请求级 inflight 限制，读取请求体在分析 deadline 外；批量 `BackendError` 尚未像 detect 一样映射到 503。
-- **批次配置边界。** `analyze_batch` 的正数检查在评分器构造时，不在 Settings 启动校验时。
-- **OpenAPI 未声明请求体。** detect/analyze 手动读取 Request 并做 Pydantic 校验，运行时安全，但 OpenAPI 看不出字段；`DetectionResult` 等旧模型未绑定为 response_model，不能当作当前响应契约。
-- **能力边界。** SDK 已提供 detect/audit/info/ready，尚无 analyze 方法。profile 仍须显式选择并与 checkpoint 匹配，不能承诺任意权重自动适配。
+- **身份检查不是原子操作。** 每个真实 `/generate` 前 GET `/model_info` 核验，不再永久缓存 `_verified`；但两个请求间仍可能发生远端模型切换，不能承诺检查/采集原子性。该额外往返的成本不在历史性能快照中。
+- **请求与后端额度分开。** 所有业务入口及 ready 共享请求并发限制；真实后端 HTTP 另有全局额度。analyze 批量后端失败映射 503，deadline 超时映射 504，不转为阴性。
+- **配置启动校验。** `analyze_batch`、`detect_batch`、`max_batch_items`、`backend_max_inflight` 必须为正整数；默认分别为 8、16、128、16。默认 body 上限为 2097152 字节。
+- **契约覆盖并非全部强类型。** detect 使用严谨共享结果模型并声明 OpenAPI；audit/analyze 共享请求模型但完整响应模型仍在演进。同步/异步 SDK 均有 detect/detect_batch/analyze/audit/info/ready。
+- **profile 规则仍须显式匹配。** A6 保留截至当前检查点的全部历史与 CoT；A5 简化规则会选窗。不能把所有 profile 说成最近 N 个动作块，也不能承诺任意权重自动适配。
 
 ### 尚未验收的部分
 

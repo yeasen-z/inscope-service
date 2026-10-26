@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inscope"
-version = "0.5.0"
+version = "0.6.0"
 description = "InScope core service: activation-based IPI detection over sglang-inscope"
 requires-python = ">=3.11"
 dependencies = [

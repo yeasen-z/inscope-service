@@ -7,6 +7,7 @@
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -53,26 +54,41 @@ def _read_manifest(ckpt_path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _integer_indices(values, name, *, minimum=None, maximum=None):
+    """Reject lossy coercions and repeated capture axes; preserve declared order."""
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError("%s must be a nonempty sequence of integers" % name)
+    if any(type(value) is not int for value in values):
+        raise ValueError("%s must contain integers" % name)
+    if len(set(values)) != len(values):
+        raise ValueError("%s must be unique" % name)
+    if any((minimum is not None and value < minimum)
+           or (maximum is not None and value > maximum) for value in values):
+        raise ValueError("%s indices must be in %s..%s" % (name, minimum, maximum))
+    return tuple(values)
+
+
 def _resolve_layers(ck: dict, manifest: dict | None) -> tuple[tuple[int, ...], LayerSemantics]:
     """确定 SGLang 边界层号。
 
     优先用 manifest 显式给出的 inscope_layers（已换算好的边界号）；
     否则用 checkpoint 的 block_indices 按声明的语义换算。
     """
-    if manifest and manifest.get("inscope_layers"):
-        layers = tuple(int(x) for x in manifest["inscope_layers"])
+    if manifest is not None and "inscope_layers" in manifest:
+        layers = _integer_indices(manifest["inscope_layers"], "inscope_layers",
+                                  minimum=0, maximum=36)
         # manifest 给出的是边界号，本身已是最终形态。
         return layers, LayerSemantics.BOUNDARY
 
     blocks = ck.get("selected_layer_indices") or ck.get("layer_indices")
     if not blocks:
         raise ValueError("Checkpoint declares no layer indices")
-    blocks = tuple(int(x) for x in blocks)
     semantic = ck.get("layer_semantics")
     if semantic == LayerSemantics.BOUNDARY.value:
-        return blocks, LayerSemantics.BOUNDARY
+        return _integer_indices(blocks, "layer indices", minimum=0, maximum=36), LayerSemantics.BOUNDARY
     if semantic == LayerSemantics.BLOCK_OUTPUT.value:
-        spec = build_layer_spec(blocks, LayerSemantics.BLOCK_OUTPUT)
+        blocks = _integer_indices(blocks, "block indices", minimum=0, maximum=35)
+        spec = build_layer_spec(blocks, LayerSemantics.BLOCK_OUTPUT, num_layers=36)
         return spec.capture_layers, LayerSemantics.BLOCK_OUTPUT
     raise ValueError(
         "Checkpoint has no usable layer semantics (layer_semantics=%r); "
@@ -116,8 +132,16 @@ class Probe:
         if not torch.isfinite(features).all():
             raise ValueError("Feature tensor contains non-finite values")
         x = (features.float() - self.mean) / self.std
-        logit = float(self.module(x).reshape(-1)[0].item())
-        return logit, float(torch.sigmoid(torch.tensor(logit)).item())
+        if not torch.isfinite(x).all():
+            raise ValueError("Normalized features contain non-finite values")
+        output = self.module(x)
+        if not torch.isfinite(output).all():
+            raise ValueError("Probe output contains non-finite values")
+        logit = float(output.reshape(-1)[0].item())
+        probability = float(torch.sigmoid(torch.tensor(logit)).item())
+        if not (math.isfinite(logit) and math.isfinite(probability)):
+            raise ValueError("Probe score contains non-finite values")
+        return logit, probability
 
     def flatten(self, layer_blocks: Sequence[torch.Tensor]) -> torch.Tensor:
         """按 checkpoint 声明的 flatten_order 组装特征向量。
@@ -148,17 +172,11 @@ class Probe:
 
 
 def _build_module(arch: str, state: dict, input_dim: int) -> nn.Module:
-    if arch == "linear":
-        expected = {"probe.weight": (1, input_dim), "probe.bias": (1,)}
-        flat = {
-            "0.weight": state["probe.weight"],
-            "0.bias": state["probe.bias"],
-        }
-    elif arch == "mlp":
-        expected = {"probe.weight": (1, input_dim), "probe.bias": (1,)}
-        flat = {"0.weight": state["probe.weight"], "0.bias": state["probe.bias"]}
-    else:
+    if arch != "linear":
+        # No MLP schema (hidden widths/activations) is defined; never guess a
+        # linear substitute for weights claiming a different architecture.
         raise ValueError("Unsupported probe_architecture: %r" % (arch,))
+    expected = {"probe.weight": (1, input_dim), "probe.bias": (1,)}
 
     for name, shape in expected.items():
         if name not in state:
@@ -169,6 +187,7 @@ def _build_module(arch: str, state: dict, input_dim: int) -> nn.Module:
         if not torch.isfinite(value).all():
             raise ValueError("Tensor %r has non-finite values" % (name,))
 
+    flat = {"0.weight": state["probe.weight"], "0.bias": state["probe.bias"]}
     module = nn.Sequential(nn.Linear(input_dim, 1))
     module.load_state_dict(flat)
     return module.eval()
@@ -230,7 +249,7 @@ def load_probe(ckpt_path, *, expected_input_dim: int | None = None) -> Probe:
     positions = ck.get("selected_positions") or (manifest or {}).get("selected_positions")
     if not positions:
         raise ValueError("Checkpoint declares no selected_positions")
-    positions = tuple(int(x) for x in positions)
+    positions = _integer_indices(positions, "selected_positions")
 
     norm = ck.get("feature_normalization") or "standard"
     if norm != "standard":
@@ -257,7 +276,12 @@ def load_probe(ckpt_path, *, expected_input_dim: int | None = None) -> Probe:
     threshold = ck.get("threshold")
     if threshold is None:
         raise ValueError("Checkpoint declares no threshold")
-    threshold = float(threshold)
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Checkpoint threshold must be finite and in 0..1") from exc
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Checkpoint threshold must be finite and in 0..1")
 
     flatten_order = (manifest or {}).get("flatten_order") or ck.get("flatten_order")
 

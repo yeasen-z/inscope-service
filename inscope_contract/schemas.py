@@ -12,6 +12,10 @@ class DetectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     messages: list[dict[str, Any]] = Field(min_length=1, max_length=128)
     tools: list[dict[str, Any]] | None = None
+    # 可选：覆盖启动期默认编排策略；必须与已加载探针兼容。
+    composer_profile: str | None = Field(default=None, min_length=1)
+    # 可选：只要这些风险的结果（须是服务已加载的子集）；None 表示全部已加载风险。
+    enabled_risks: list[str] | None = Field(default=None, min_length=1)
 
     @field_validator("messages")
     @classmethod
@@ -37,23 +41,126 @@ class DetectionRequest(BaseModel):
         return messages
 
 
-class DetectionResult(BaseModel):
-    """检测结果；字段名是对外契约的一部分。"""
+class BankRiskVerdict(BaseModel):
+    """单个风险的判定：阈值来自该风险自己的 checkpoint。"""
 
-    score: float
-    logit: float
-    threshold: float
-    threshold_logit: float
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    score: float = Field(ge=0, le=1)
+    threshold: float = Field(ge=0, le=1)
     flagged: bool
-    risk: str
-    model: str
+
+
+class DetectionResult(BaseModel):
+    """Successful /detect response; numeric values are finite and in probability units."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False,
+                              populate_by_name=True)
+    probability: float = Field(ge=0, le=1)
+    logit: float
+    threshold: float = Field(ge=0, le=1)
+    label: Literal["attack", "benign"]
+    risk: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    input_tokens: int = Field(ge=0)
+    request_id: str = Field(min_length=1)
+    # 数字（历史形态）或 {阶段: 毫秒}（Probe Bank 兼容形态，含 total）。
+    latency_ms: float | dict[str, float]
+    composer_profile: str = Field(min_length=1)
+    checkpoint_sha256: str = Field(min_length=1)
+    composer: dict[str, Any] | None = None
+    normalization: dict[str, Any] | None = None
+    # 多风险（Probe Bank 兼容）字段：只在注册了额外探针时出现。
+    enabled_risks: list[str] | None = None
+    disabled_risks: list[str] | None = None
+    overall: bool | None = None
+    profile_name: str | None = Field(default=None, alias="profile")
+    per_risk: dict[str, BankRiskVerdict] | None = None
+    per_entry: dict[str, float] | None = None
+    triggered_entries: list[str] | None = None
+    detector_model: str | None = None
+    bank_version: str | None = None
+    scores: dict[str, tuple[float, float]] | None = None
+
+    @model_validator(mode="after")
+    def validate_label(self):
+        expected = "attack" if self.probability >= self.threshold else "benign"
+        if self.label != expected:
+            raise ValueError("label is inconsistent with probability and threshold")
+        return self
+
+    @property
+    def flagged(self) -> bool:
+        """SDK compatibility convenience; not a separate wire field."""
+        return self.label == "attack"
+
+
+class DetectionItemError(BaseModel):
+    """A failed batch item has no usable score and must never be treated as benign."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    error: str = Field(min_length=1)
+    detail: str
+    status_code: int = Field(ge=400, le=599)
+    risk: str | None = None
+    model: str | None = None
+    request_id: str | None = None
+    latency_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    composer_profile: str | None = None
+    checkpoint_sha256: str | None = None
+    composer: dict[str, Any] | None = None
+    normalization: dict[str, Any] | None = None
+
+
+class DetectionBatchResult(BaseModel):
+    """Ordered batch response; successes and failures retain their original slots."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    schema_name: Literal["inscope.detect_batch.v1"] = Field(alias="schema")
+    count: int = Field(ge=1)
+    results: list[DetectionResult | DetectionItemError] = Field(min_length=1)
+    risk: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+    latency_ms: float | dict[str, float]
+    composer_profile: str = Field(min_length=1)
+    checkpoint_sha256: str = Field(min_length=1)
+    composer: dict[str, Any] | None = None
+    normalization: dict[str, Any] | None = None
+    enabled_risks: list[str] | None = None
+    disabled_risks: list[str] | None = None
+    overall: bool | None = None
+    profile_name: str | None = Field(default=None, alias="profile")
+    per_risk: dict[str, BankRiskVerdict] | None = None
+    per_entry: dict[str, float] | None = None
+    triggered_entries: list[str] | None = None
+    detector_model: str | None = None
+    bank_version: str | None = None
+
+    @model_validator(mode="after")
+    def validate_count(self):
+        if self.count != len(self.results):
+            raise ValueError("count does not match results length")
+        return self
+
+
+class DetectionBatchRequest(BaseModel):
+    """Batch wire shape; the service validates each conversation independently."""
+
+    model_config = ConfigDict(extra="forbid")
+    messages: list[list[dict[str, Any]]] = Field(min_length=1, max_length=128)
+    tools: list[dict[str, Any]] | None = None
+    composer_profile: str | None = Field(default=None, min_length=1)
+
+
+DetectionResponse = DetectionResult | DetectionBatchResult
 
 
 class AnalyzeRequest(DetectionRequest):
     """/analyze 的输入：在完整请求之上指定要对哪条 observation 做定位。
 
     粒度/预算都是显式参数，服务端不自动跑多路；缺省 paragraph + auto，
-    auto 会按段落数在 exact / hierarchical 之间自行降级。
+    auto 会按段落数在 exact / hierarchical 之间自行降级。可选
+    ``composer_profile`` 覆盖本次请求的上下文编排策略，必须与探针兼容。
     """
 
     observation_index: int = Field(ge=0)
@@ -84,7 +191,6 @@ class AuditRequest(DetectionRequest):
     checkpoint_roles: list[Literal["tool", "user", "assistant", "system", "developer"]] = Field(
         default_factory=lambda: ["tool", "user"])
     start_index: int = Field(default=0, ge=0)
-    thresholds: list[float] | None = None
 
     @field_validator("checkpoint_roles")
     @classmethod
