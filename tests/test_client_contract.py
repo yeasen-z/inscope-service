@@ -90,3 +90,78 @@ def test_probe_id_differs_for_other_feature_name(tmp_path):
     a = load_probe(write_checkpoint(tmp_path, sub="a", feature_name="feat_a"))
     b = load_probe(write_checkpoint(tmp_path, sub="b", feature_name="feat_b"))
     assert a.spec.probe_id != b.spec.probe_id
+
+
+def test_client_reuses_one_connection_across_calls():
+    """同步 Client 必须复用连接：每次重建约多花 50ms，高频调用下不可接受。"""
+    import httpx
+    from inscope import client as client_module
+
+    built = []
+
+    class FakeSession:
+        def __init__(self, **kw):
+            built.append(kw)
+            self.closed = False
+            self.calls = 0
+
+        def get(self, path, **kw):
+            self.calls += 1
+            return httpx.Response(200, json={"status": "ready"},
+                                  request=httpx.Request("GET", "http://x" + path))
+
+        def post(self, path, **kw):
+            self.calls += 1
+            return httpx.Response(200, json={
+                "logit": 0.0, "probability": 0.5, "threshold": 0.9, "label": "benign",
+                "risk": "r", "model": "m", "input_tokens": 1, "request_id": "id",
+                "latency_ms": 1.0}, request=httpx.Request("POST", "http://x" + path))
+
+        def close(self):
+            self.closed = True
+
+    original = client_module.httpx.Client
+    client_module.httpx.Client = FakeSession
+    try:
+        client = client_module.Client("http://127.0.0.1:8302", api_key="k")
+        client.ready()
+        client.ready()
+        client.detect([{"role": "user", "content": "x"}])
+        # 三次调用只应创建一个会话
+        assert len(built) == 1, built
+        assert built[0]["headers"] == {"Authorization": "Bearer k"}
+        session = client._session
+        client.close()
+        assert session.closed is True
+        assert client._session is None
+        # 关闭后再次使用会重新创建，不会复用已关闭的会话
+        client.ready()
+        assert len(built) == 2
+        client.close()
+    finally:
+        client_module.httpx.Client = original
+
+
+def test_client_usable_as_context_manager():
+    import httpx
+    from inscope import client as client_module
+
+    class FakeSession:
+        def __init__(self, **kw):
+            self.closed = False
+
+        def get(self, path, **kw):
+            return httpx.Response(200, json={}, request=httpx.Request("GET", "http://x"))
+
+        def close(self):
+            self.closed = True
+
+    original = client_module.httpx.Client
+    client_module.httpx.Client = FakeSession
+    try:
+        with client_module.Client("http://127.0.0.1:8302") as client:
+            client.ready()
+            session = client._session
+        assert session.closed is True
+    finally:
+        client_module.httpx.Client = original

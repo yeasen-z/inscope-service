@@ -10,13 +10,19 @@ def _reject_nonfinite(value):
     raise ValueError("Non-finite tool argument JSON: " + value)
 
 
-def normalize_payload(payload):
+def normalize_payload(payload, *, extra_fields=()):
+    """规范化 messages/tools 的形状。
+
+    ``extra_fields`` 供 /analyze 这类接口使用：它们在同一份 chat 请求上
+    追加自己的参数，不在这里被当成非法字段。传进来的字段原样保留。
+    """
     changes = []
+    allowed = {"messages", "tools"} | set(extra_fields)
     if isinstance(payload, list):
         payload = {"messages": payload}
         changes.append("request.list_to_object")
-    if not isinstance(payload, dict) or set(payload) - {"messages", "tools"}:
-        raise ValueError("Expected only messages and tools")
+    if not isinstance(payload, dict) or set(payload) - allowed:
+        raise ValueError("Expected only %s" % ", ".join(sorted(allowed)))
     result = copy.deepcopy(payload)
     messages = result.get("messages")
     if not isinstance(messages, list) or not 1 <= len(messages) <= 128:
@@ -123,3 +129,29 @@ def normalize_payload(payload):
         canonical_tools.append(canonical)
     result["tools"] = canonical_tools
     return result, changes
+
+
+def split_detect_payload(payload):
+    """把 /detect 请求体拆成 (请求列表, tools, 是否批量)。
+
+    默认批量：``messages`` 为二维列表即多条；一维列表视为单条，
+    保持旧调用方不受影响。``tools`` 由整批共享（同一套工具定义）。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("body must be an object")
+    if "messages" not in payload:
+        raise ValueError("missing messages")
+    messages = payload["messages"]
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must be a non-empty list")
+    tools = payload.get("tools")
+    extra = set(payload) - {"messages", "tools"}
+    if extra:
+        raise ValueError("unexpected fields: %s" % ", ".join(sorted(extra)))
+    # 二维（元素是列表）→ 批量；否则单条
+    if all(isinstance(item, list) for item in messages):
+        requests = [{"messages": item, "tools": tools} for item in messages]
+        return requests, tools, True
+    if any(isinstance(item, list) for item in messages):
+        raise ValueError("messages is neither a single message list nor a batch")
+    return [{"messages": messages, "tools": tools}], tools, False

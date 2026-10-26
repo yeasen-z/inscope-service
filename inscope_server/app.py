@@ -1,23 +1,32 @@
+"""HTTP 入口：依赖生命周期、鉴权、请求校验和结果封装。"""
 import asyncio
 from contextlib import asynccontextmanager
 import hmac
 import json
-import logging
 import time
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
-from inscope_contract import DetectionRequest, ENDPOINTS, MODEL_LABEL, RISK_TYPE
+from inscope_contract import (
+    AnalyzeRequest,
+    AuditRequest,
+    DetectionRequest,
+    ENDPOINTS,
+    MODEL_LABEL,
+    RISK_TYPE,
+)
 
-from .backend import BackendError, InScopeBackend
+from .analyze import analyze as localize_observation
+from .audit import audit_trajectory
+from .batching import make_batched_scorer
+from .backend import InScopeBackend
 from .config import Settings, validate_model
-from .context_profile import bind_profile, compose, get_profile
-from .normalization import normalize_payload
+from .context_profile import bind_profile, get_profile
+from .normalization import normalize_payload, split_detect_payload
 from .probe import load_probe
-
-log = logging.getLogger(__name__)
+from .scoring import ScoringPipeline
 
 # 就绪探针必须长到能覆盖探针声明的负向位置；不足时由 capture 报 422。
 READY_PROMPT = "Hello, please confirm the detection pipeline is operational."
@@ -66,41 +75,7 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
         if not hmac.compare_digest(auth.encode(), ("Bearer " + settings.api_key).encode()):
             raise HTTPException(401, "Invalid API key", headers={"WWW-Authenticate": "Bearer"})
 
-    async def capture(messages, tools=None):
-        active = state["probe"]
-        try:
-            # Context Composer 按 profile 产出唯一可用的 input_ids；
-            # 后端只允许原样转发，不得重新渲染或重新 tokenize。
-            ctx = await asyncio.to_thread(compose, state["tokenizer"], messages, tools, profile)
-        except NotImplementedError as exc:
-            raise HTTPException(501, "Composer profile is not implemented") from exc
-        except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
-            raise HTTPException(422, "Invalid conversation or tool template input") from exc
-        ids = list(ctx.input_ids)
-        if len(ids) > settings.max_tokens:
-            raise HTTPException(413, "Input exceeds %d tokens; no truncation applied"
-                                % settings.max_tokens)
-        # 探针声明的负向位置要求输入至少有这么长；提前给出明确原因。
-        need = max((-p for p in active.selected_positions if p < 0), default=0)
-        if len(ids) < need:
-            raise HTTPException(422, "Input has %d tokens but the probe needs at least %d"
-                                % (len(ids), need))
-        try:
-            hidden = await state["backend"].capture(
-                ids, active.capture_layers, active.selected_positions)
-        except TimeoutError as exc:
-            raise HTTPException(504, "SGLang request timed out") from exc
-        except BackendError as exc:
-            log.warning("Shadow backend failed: %s", type(exc).__name__)
-            raise HTTPException(503, "Shadow feature backend unavailable") from exc
-        try:
-            logit, prob = active.score(active.flatten(hidden))
-        except ValueError as exc:
-            raise HTTPException(503, "Invalid InScope features or score") from exc
-        score = {"logit": logit, "probability": prob,
-                 "threshold": active.threshold,
-                 "label": "attack" if prob >= active.threshold else "benign"}
-        return score, len(ids), ctx.profile
+    pipeline = ScoringPipeline(state, settings, profile)
 
     @app.get(ENDPOINTS["live"])
     async def live():
@@ -116,7 +91,7 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
         inflight += 1
         try:
             async with asyncio.timeout(settings.timeout):
-                _, _, profile_used = await capture(
+                _, _, profile_used = await pipeline.capture(
                     [{"role": "user", "content": READY_PROMPT}])
             return {"status": "ready",
                     "model": MODEL_LABEL,
@@ -157,6 +132,14 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
 
     @app.post(ENDPOINTS["detect"])
     async def detect(request: Request):
+        """检测注入风险。默认接收批量，也兼容单条。
+
+        批量：``{"messages": [[...], [...]]}`` —— messages 为二维列表
+        单条：``{"messages": [...]}`` —— 一维列表，返回结果与旧版完全一致
+
+        批量里每条独立评分、独立报错：一条失败不会拖垮整批，
+        失败项以 ``error`` 字段返回，绝不伪装成 benign。
+        """
         authenticate(request)
         nonlocal inflight
         if inflight >= settings.max_inflight:
@@ -173,25 +156,133 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None):
                     body.extend(chunk)
                 try:
                     payload = json.loads(body)
-                    normalized, changes = normalize_payload(payload)
-                    parsed = DetectionRequest.model_validate(normalized)
+                    requests, tools, batch = split_detect_payload(payload)
+                    parsed = [DetectionRequest.model_validate(item) for item in requests]
                 except (ValueError, UnicodeError, ValidationError) as exc:
                     raise HTTPException(
-                        422, "Expected messages list or {messages: [...], tools?: [...]}") from exc
-                result, tokens, profile_used = await capture(parsed.messages, parsed.tools)
-                return {**result,
-                        "risk": RISK_TYPE,
-                        "model": MODEL_LABEL,
-                        "composer": profile_used,
-                        "composer_profile": profile_used["profile_id"],
-                        "normalization": {"applied": bool(changes), "changes": changes},
-                        "checkpoint_sha256": state["probe"].sha256,
-                        "input_tokens": tokens,
-                        "request_id": request_id,
-                        "latency_ms": round((time.perf_counter() - start) * 1000, 2)}
+                        422, "Invalid detect request: %s" % exc) from exc
+                results = await pipeline.detect_batch(parsed)
+                described = profile.describe()
+                common = {
+                    "risk": RISK_TYPE,
+                    "model": MODEL_LABEL,
+                    "composer": described,
+                    "composer_profile": described["profile_id"],
+                    "checkpoint_sha256": state["probe"].sha256,
+                    "request_id": request_id,
+                    "latency_ms": round((time.perf_counter() - start) * 1000, 2),
+                }
+                items = [{**row, **common} for row in results]
+                if batch:
+                    return {**common, "schema": "inscope.detect_batch.v1",
+                            "count": len(items), "results": items}
+                return items[0]
         except TimeoutError as exc:
             raise HTTPException(504, "Detection deadline exceeded") from exc
         finally:
             inflight -= 1
+
+    @app.post(ENDPOINTS["audit"])
+    async def audit(request: Request):
+        """沿执行轨迹逐检查点评分，回答"最早在哪一步检出"。
+
+        与 detect 共用编排和探针评分；不构造反事实，只回放各时刻可见的上下文。
+        评分失败会记入 failed_at 并标 incomplete，不会被当成阴性。
+        """
+        authenticate(request)
+        start = time.perf_counter()
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > settings.max_body_bytes:
+                raise HTTPException(413, "Request exceeds body size limit")
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+            normalized, changes = normalize_payload(
+                payload, extra_fields=("checkpoint_roles", "start_index"))
+            parsed = AuditRequest.model_validate(normalized)
+        except (ValueError, UnicodeError, ValidationError) as exc:
+            raise HTTPException(422, "Invalid audit request: %s" % exc) from exc
+
+        async def score_at(window):
+            score, tokens, _described = await pipeline.capture(
+                window["messages"], window["tools"])
+            return {**score, "input_tokens": tokens}
+
+        try:
+            async with asyncio.timeout(settings.audit_timeout):
+                result = await audit_trajectory(
+                    parsed.messages, score_at, tools=parsed.tools,
+                    roles=tuple(parsed.checkpoint_roles),
+                    start_index=parsed.start_index,
+                    case_id=request_id)
+        except TimeoutError as exc:
+            raise HTTPException(
+                504, "Audit exceeded %ss deadline" % settings.audit_timeout) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {**result,
+                "risk": RISK_TYPE,
+                "model": MODEL_LABEL,
+                "composer": profile.describe(),
+                "composer_profile": profile.profile_id,
+                "normalization": {"applied": bool(changes), "changes": changes},
+                "checkpoint_sha256": state["probe"].sha256,
+                "request_id": request_id,
+                "latency_ms": round((time.perf_counter() - start) * 1000, 2)}
+
+    @app.post(ENDPOINTS["analyze"])
+    async def analyze(request: Request):
+        """定位一条 observation 内影响探针评分的关键区间。
+
+        与 detect 共享编排和探针评分；特征请求使用批量后端。
+        当前仅限制每批规模和总超时，尚无 analyze 请求级并发隔离。
+        """
+        authenticate(request)
+        start = time.perf_counter()
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > settings.max_body_bytes:
+                raise HTTPException(413, "Request exceeds body size limit")
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+            normalized, changes = normalize_payload(
+                payload,
+                extra_fields=("observation_index", "granularity", "mode",
+                              "focus", "group_size", "max_coalitions"))
+            parsed = AnalyzeRequest.model_validate(normalized)
+        except (ValueError, UnicodeError, ValidationError) as exc:
+            raise HTTPException(422, "Invalid analyze request: %s" % exc) from exc
+
+        score_batch = make_batched_scorer(pipeline.score_prompts, max_batch=settings.analyze_batch)
+        try:
+            async with asyncio.timeout(settings.analyze_timeout):
+                result = await localize_observation(
+                    {"messages": parsed.messages, "tools": parsed.tools},
+                    observation_index=parsed.observation_index,
+                    score_batch=score_batch,
+                    case_id=request_id,
+                    granularity=parsed.granularity,
+                    mode=parsed.mode,
+                    focus=parsed.focus,
+                    group_size=parsed.group_size,
+                    max_coalitions=parsed.max_coalitions)
+        except TimeoutError as exc:
+            raise HTTPException(
+                504, "Analysis exceeded %ss deadline" % settings.analyze_timeout) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {**result,
+                "risk": RISK_TYPE,
+                "model": MODEL_LABEL,
+                "composer": profile.describe(),
+                "composer_profile": profile.profile_id,
+                "normalization": {"applied": bool(changes), "changes": changes},
+                "checkpoint_sha256": state["probe"].sha256,
+                "request_id": request_id,
+                "latency_ms": round((time.perf_counter() - start) * 1000, 2)}
 
     return app

@@ -38,6 +38,10 @@ flowchart TB
 
 单次探测流程：**输入上下文 → Composer 编排 → 引擎提取特征 → 探针打分 → 返回结果**。业务调用方根据该探针的任务与标签定义解释结果，而不是由服务名称推断含义。
 
+代码职责、调用链和已知协议限制见 [代码导览](<docs/architecture.md>)。三个业务接口的现状与补齐顺序见 [多接口支持说明](<docs/api-support.md>)。真实环境下的延迟拆解与各接口实测数字见 [实测性能](<docs/performance.md>)。
+
+> 当前 `/analyze` HTTP 批量请求体仍有已确认的不匹配，CPU mock 测试不能替代真实引擎验收；不要将这条路径视为生产就绪。详见代码导览中的待修问题。
+
 ## 快速开始
 
 ### 1. 安装
@@ -148,6 +152,8 @@ asyncio.run(main())
 | GET | `/health/ready` | 实际运行检测链路，确认服务就绪 |
 | GET | `/info` | 查询当前探针、层号、位置、阈值和 Composer 配置 |
 | POST | `/detect` | 检测对话；请求包含 `messages`，可选 `tools` |
+| POST | `/audit` | 沿轨迹逐检查点评分，找出首次检出的步骤 |
+| POST | `/analyze` | 定位一条 observation 内影响评分的关键区间 |
 
 检测结果的主要字段：
 
@@ -166,6 +172,65 @@ asyncio.run(main())
 
 常见错误：`401` 鉴权失败、`413` 输入超限、`422` 输入不合法、`429` 并发已满、`503` 特征后端或打分异常、`504` 超时。超长输入会被拒绝，不会静默截断。
 
+### `/audit`：沿轨迹找首次检出
+
+`/detect` 只看最后一次判断。`/audit` 按执行轨迹逐步回放：第 i 步只使用
+`messages[:i+1]`，绝不带入之后的消息，然后输出评分时间线与首次检出下标。
+
+请求字段：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `checkpoint_roles` | `["tool","user"]` | 哪些角色的消息作为检查点 |
+| `start_index` | `0` | 从哪条消息开始审计 |
+
+结果里的 `status` 有三种，**不要混读**：
+
+- `clear`：所有检查点都跑完且都低于阈值
+- `incomplete`：有检查点没跑或失败——这不是"未检出"
+- `flagged`：至少一步越过阈值
+
+`first_flagged_index` 表示"截至该步的累积上下文已越过阈值"，**不代表攻击在该步发生**，
+也不代表它导致了后续行为。这个边界写在响应的 `semantics` 字段里。
+
+各步上下文不同，无法合并成一批，因此 audit 走单条采集；并发由 `INSCOPE_AUDIT_CONCURRENCY` 控制。
+
+### `/analyze`：定位影响评分的区间
+
+`/detect` 返回当前探针的分数与阈值判定；`/analyze` 比较指定 observation 中哪些区间相对影响评分。
+它按粒度切分文本，枚举保留/删除组合并重新打分；定位结果不是攻击真实性的证明。
+
+请求在 `/detect` 的基础上增加：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `observation_index` | 必填 | 要分析的 observation 在 `messages` 中的下标（0 起算） |
+| `granularity` | `paragraph` | 切分粒度：`paragraph` / `line` / `sentence`，单选，不自动跑三路 |
+| `mode` | `exact` | `exact` 精确枚举全部单元；`hierarchical` 组内精确再细化 |
+| `focus` | `high` | 找相对影响较高 / 较低的簇 |
+| `group_size` | `6` | 分层模式的组大小 |
+| `max_coalitions` | `256` | 根组超预算报错；分层细化预算不足保留粗区间并标记限制 |
+
+返回的关键字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `status` | `localized`；或 `resolution_limited` / `no_unique_separation` / `conditional_ranking_unstable` 等不确定状态 |
+| `regions` | 最终选中片段，**可能不连续** |
+| `interval` | 上者的连续包络，中间可能混有非目标文字 |
+| `atoms` / `segments` | 用户粒度原始单元 / 根比较组 |
+| `levels` | 每层自己的 segments、search、queries；`queries[].mask` 是**该层局部位图** |
+| `cost` | `coalitions` / `unique_inputs` / `score_batches` |
+
+使用注意：
+
+- **颜色只是组内相对高低**，按当前组的 min/max 归一化；低分不代表安全，也没有绝对告警阈值。
+- `regions` 不连续，画成一段连续高亮就是错的；`resolution` 不是 `atomic` 时保留粗区间，不要画成精确边界。
+- 各层 `queries` 行数不能相加当模型请求数，相同文本会复用。
+- 与 `/detect` 共享编排和探针评分，采集走批量方法；`INSCOPE_ANALYZE_TIMEOUT`（默认 900 秒）限制分析阶段。请求体读取目前不在该 deadline 内。
+- 不静默截断输入，不将非有限分数或后端错误转成“未检出”。子层预算不足可返回粗区间；当前批量后端错误的 HTTP 映射仍需完善。
+- `cost.score_batches` 是算法评分轮数，不是 HTTP 次数；实际每桶最多 `INSCOPE_ANALYZE_BATCH` 份输入，各桶串行发送。
+
 ## 配置参考
 
 | 环境变量 | 必填 / 默认值 | 说明 |
@@ -178,7 +243,11 @@ asyncio.run(main())
 | `SGLANG_API_KEY` | 空 | 引擎启用鉴权时使用，与本服务口令不同 |
 | `INSCOPE_MAX_INPUT_TOKENS` | `40959` | 输入 token 上限，可调小 |
 | `INSCOPE_MAX_INFLIGHT` | `16` | 检测及就绪检查的并发上限 |
-| `INSCOPE_REQUEST_TIMEOUT` | `60` | 请求超时，单位秒 |
+| `INSCOPE_REQUEST_TIMEOUT` | `60` | 检测及单次引擎请求超时，单位秒 |
+| `INSCOPE_ANALYZE_TIMEOUT` | `900` | 分析阶段总超时，单位秒 |
+| `INSCOPE_ANALYZE_BATCH` | `8` | 每个分析批次的 prompt 数上限，不是 GPU 并发数 |
+| `INSCOPE_AUDIT_TIMEOUT` | `1800` | 轨迹审计总超时，单位秒 |
+| `INSCOPE_AUDIT_CONCURRENCY` | `4` | 审计时同时在途的检查点数 |
 
 HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为 `0.0.0.0:8302`；对外部署时应限制访问并在代理层配置 TLS。
 

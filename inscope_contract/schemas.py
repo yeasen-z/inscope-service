@@ -1,7 +1,7 @@
 """HTTP 输入输出契约。服务端与调用方共用，避免两边各写一份校验。"""
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .constants import SUPPORTED_ROLES
 
@@ -47,3 +47,56 @@ class DetectionResult(BaseModel):
     flagged: bool
     risk: str
     model: str
+
+
+class AnalyzeRequest(DetectionRequest):
+    """/analyze 的输入：在完整请求之上指定要对哪条 observation 做定位。
+
+    粒度/预算都是显式参数，服务端不自动跑多路；缺省 paragraph + auto，
+    auto 会按段落数在 exact / hierarchical 之间自行降级。
+    """
+
+    observation_index: int = Field(ge=0)
+    granularity: Literal["paragraph", "line", "sentence"] = "paragraph"
+    # auto：单元数 <= 8 用 exact（2^8=256，正好一个预算），超过则分级展开。
+    mode: Literal["auto", "exact", "hierarchical"] = "auto"
+    focus: Literal["high", "low"] = "high"
+    # 分级展开时每层组数上限；auto 会按单元数自适应，显式传入则原样使用。
+    group_size: int = Field(default=6, ge=2, le=8)
+    max_coalitions: int = Field(default=256, ge=4, le=4096)
+
+    @model_validator(mode="after")
+    def validate_observation(self):
+        if self.observation_index >= len(self.messages):
+            raise ValueError(
+                "observation_index %d is outside the %d-message request"
+                % (self.observation_index, len(self.messages)))
+        return self
+
+
+class AuditRequest(DetectionRequest):
+    """/audit 的输入：一段完整执行轨迹，按检查点逐步评分。
+
+    检查点默认是"每条 tool/user 观察"——审计关心的是新进入上下文的
+    外部内容，而不是模型自己说了什么。调用方可显式收窄起止位置。
+    """
+
+    checkpoint_roles: list[Literal["tool", "user", "assistant", "system", "developer"]] = Field(
+        default_factory=lambda: ["tool", "user"])
+    start_index: int = Field(default=0, ge=0)
+    thresholds: list[float] | None = None
+
+    @field_validator("checkpoint_roles")
+    @classmethod
+    def validate_checkpoint_roles(cls, roles):
+        if not roles:
+            raise ValueError("checkpoint_roles must not be empty")
+        return list(dict.fromkeys(roles))
+
+    @model_validator(mode="after")
+    def validate_window(self):
+        if self.start_index >= len(self.messages):
+            raise ValueError(
+                "start_index %d is outside the %d-message request"
+                % (self.start_index, len(self.messages)))
+        return self

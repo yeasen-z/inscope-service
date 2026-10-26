@@ -91,12 +91,22 @@ DEFAULT_ENGINE_PORT = 30000
 DEFAULT_MAX_INPUT_TOKENS = 40959
 DEFAULT_MAX_INFLIGHT = 16
 DEFAULT_REQUEST_TIMEOUT = 60.0
+# 分析包含多轮反事实评分，单独设置总 deadline；不是实测耗时保证。
+DEFAULT_ANALYZE_TIMEOUT = 900.0
+# 每个分析批次的 prompt 数上限；最优值依赖长度、硬件和引擎配置。
+DEFAULT_ANALYZE_BATCH = 8
+# /detect 批量：单请求内合并的 prompt 上限，与 max_inflight 对齐。
+DEFAULT_DETECT_BATCH = 16
+# 轨迹审计的对账并发：每次只评一个检查点，但不同检查点可以并行。
+DEFAULT_AUDIT_TIMEOUT = 1800.0
 DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024
 
 SUPPORTED_ROLES = ("system", "developer", "user", "assistant", "tool")
 
 ENDPOINTS = {
     "detect": "/detect",
+    "analyze": "/analyze",
+    "audit": "/audit",
     "info": "/info",
     "live": "/health/live",
     "ready": "/health/ready",

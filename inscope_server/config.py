@@ -9,6 +9,10 @@ import math
 import os
 
 from inscope_contract import (
+    DEFAULT_ANALYZE_BATCH,
+    DEFAULT_DETECT_BATCH,
+    DEFAULT_AUDIT_TIMEOUT,
+    DEFAULT_ANALYZE_TIMEOUT,
     DEFAULT_ENGINE_PORT,
     DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_INFLIGHT,
@@ -43,6 +47,14 @@ class Settings:
     max_inflight: int = DEFAULT_MAX_INFLIGHT
     timeout: float = DEFAULT_REQUEST_TIMEOUT
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    # 分析总 deadline 与单次引擎请求 timeout 分开配置。
+    analyze_timeout: float = DEFAULT_ANALYZE_TIMEOUT
+    # 每桶 prompt 数上限，不等于分析请求数或 GPU 并发上限。
+    analyze_batch: int = DEFAULT_ANALYZE_BATCH
+    # /detect 批量：单请求最多合并多少条 prompt
+    detect_batch: int = DEFAULT_DETECT_BATCH
+    # 审计总超时。检查点串行推进以命中前缀缓存，因此不存在并发参数。
+    audit_timeout: float = DEFAULT_AUDIT_TIMEOUT
 
     def __post_init__(self):
         if not self.model_path or not self.api_key:
@@ -56,6 +68,8 @@ class Settings:
                              % DEFAULT_MAX_INPUT_TOKENS)
         if not math.isfinite(self.timeout) or self.timeout <= 0 or self.max_body_bytes < 1:
             raise ValueError("Invalid timeout/body limit")
+        if not math.isfinite(self.analyze_timeout) or self.analyze_timeout < self.timeout:
+            raise ValueError("analyze_timeout must be finite and >= request timeout")
         if not self.backend_url.startswith(("http://", "https://")):
             raise ValueError("INSCOPE_ENGINE_URL must be an HTTP URL")
 
@@ -72,6 +86,11 @@ class Settings:
             max_tokens=int(os.getenv("INSCOPE_MAX_INPUT_TOKENS", str(DEFAULT_MAX_INPUT_TOKENS))),
             max_inflight=int(os.getenv("INSCOPE_MAX_INFLIGHT", str(DEFAULT_MAX_INFLIGHT))),
             timeout=float(os.getenv("INSCOPE_REQUEST_TIMEOUT", str(DEFAULT_REQUEST_TIMEOUT))),
+            analyze_batch=int(os.getenv("INSCOPE_ANALYZE_BATCH", str(DEFAULT_ANALYZE_BATCH))),
+            detect_batch=int(os.getenv("INSCOPE_DETECT_BATCH", str(DEFAULT_DETECT_BATCH))),
+            audit_timeout=float(os.getenv("INSCOPE_AUDIT_TIMEOUT", str(DEFAULT_AUDIT_TIMEOUT))),
+            analyze_timeout=float(os.getenv("INSCOPE_ANALYZE_TIMEOUT",
+                                            str(DEFAULT_ANALYZE_TIMEOUT))),
         )
 
 
