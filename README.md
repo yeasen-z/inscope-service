@@ -229,6 +229,12 @@ audit 按检查点串行推进并走单条采集，没有独立的 audit concurr
 `/detect` 返回当前探针的分数与阈值判定；`/analyze` 比较指定 observation 中哪些区间相对影响评分。
 它按粒度切分文本，枚举保留/删除组合并重新打分；定位结果不是攻击真实性的证明。
 
+**observation-block 探针不依赖 `/analyze` 做定位**：`/detect` 的 `explain` 在同一次前向里就给出每个块的
+`attention_weight` / `attention_contribution`，块级定位用那份数据即可，代价为零。
+这类探针上跑 `/analyze` 仍然能给出自洽的相对排序（删段组合的 phi 合计等于首尾 logit 差），
+但「删掉全部段落」对它是结构改动——采集行随之消失，只剩空锚点，logit 会落进训练没出现过的区间，
+所以 phi 的**绝对值不可读**，只能看排序。块级定位不要引用 `/analyze` 的数值。
+
 请求在 `/detect` 的基础上增加：
 
 | 字段 | 默认 | 含义 |
