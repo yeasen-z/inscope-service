@@ -16,6 +16,9 @@ class DetectionRequest(BaseModel):
     composer_profile: str | None = Field(default=None, min_length=1)
     # 可选：只要这些风险的结果（须是服务已加载的子集）；None 表示全部已加载风险。
     enabled_risks: list[str] | None = Field(default=None, min_length=1)
+    # 可选：observation_blocks 探针返回 block 级 attention 通道（同一次前向的
+    # 副产品）；其他架构的探针忽略该字段。
+    explain: bool = False
 
     @field_validator("messages")
     @classmethod
@@ -80,6 +83,13 @@ class DetectionResult(BaseModel):
     detector_model: str | None = None
     bank_version: str | None = None
     scores: dict[str, tuple[float, float]] | None = None
+    # observation_blocks 探针的 explain 输出（仅 explain=true 时出现）。
+    # blocks[].message_index 属于 compiled_messages 坐标系，见 coordinate_system。
+    blocks: list[dict[str, Any]] | None = None
+    coordinate_system: Literal["compiled_messages"] | None = None
+    compiled_context: str | None = None
+    capture_positions: list[int] | None = None
+    importance_semantics: str | None = None
 
     @model_validator(mode="after")
     def validate_label(self):

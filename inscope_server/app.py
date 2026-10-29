@@ -36,6 +36,15 @@ from .scoring import ScoringPipeline
 # 就绪探针必须长到能覆盖探针声明的负向位置；不足时由 capture 报 422。
 log = logging.getLogger(__name__)
 READY_PROMPT = "Hello, please confirm the detection pipeline is operational."
+# observation_blocks 探针要求存在 assistant 动作 + 其后的观察，普通单句不满足。
+READY_PROMPT_BLOCKS = [
+    {"role": "user", "content": "Please check the server status."},
+    {"role": "assistant", "content": None,
+     "tool_calls": [{"id": "call_ready", "type": "function",
+                     "function": {"name": "check_status", "arguments": "{}"}}]},
+    {"role": "tool", "tool_call_id": "call_ready", "name": "check_status",
+     "content": "All services are running normally."},
+]
 
 
 def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probes=None):
@@ -80,6 +89,15 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probe
                         % (risk, list(candidate.selected_positions), profile.profile_id,
                            list(wanted)))
             state.setdefault("primary_risk", settings.primary_risk)
+        # observation_blocks 探针的采集/打分路径与 fixed_positions 探针不共享，
+        # 多风险共实例会让 block 探针拿到按错误规则编排的输入；单实例单探针。
+        loaded_all = [state["probe"], *(state["probes"] or {}).values()]
+        if len(loaded_all) > 1 and any(
+                getattr(candidate, "feature_layout", None) == "observation_blocks"
+                for candidate in loaded_all):
+            raise ValueError(
+                "observation_blocks probes must run in a single-risk instance; "
+                "do not combine with INSCOPE_PROBES")
         state["backend"] = state["backend"] or InScopeBackend(settings)
         try:
             yield
@@ -201,8 +219,10 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probe
         inflight += 1
         try:
             async with asyncio.timeout(settings.timeout):
-                _, _, profile_used = await pipeline.capture(
-                    [{"role": "user", "content": READY_PROMPT}])
+                ready_messages = (READY_PROMPT_BLOCKS
+                                  if profile.position_mode == "blocks" else
+                                  [{"role": "user", "content": READY_PROMPT}])
+                _, _, profile_used = await pipeline.capture(ready_messages)
             return {"status": "ready",
                     "model": MODEL_LABEL,
                     "probe": state["probe"].spec.probe_id,
@@ -288,7 +308,7 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probe
                 for slot, item in enumerate(requests):
                     try:
                         normalized, changes = normalize_payload(
-                            item, extra_fields=("composer_profile", "enabled_risks"))
+                            item, extra_fields=("composer_profile", "enabled_risks", "explain"))
                         parsed.append(DetectionRequest.model_validate(normalized))
                         slots.append(slot)
                         normalizations[slot] = {"applied": bool(changes), "changes": changes}
@@ -312,7 +332,8 @@ def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probe
                                        if "error" not in row), 0)
                     else:
                         row, bank_scores, _described = await pipeline.collect(
-                            parsed[0].messages, parsed[0].tools)
+                            parsed[0].messages, parsed[0].tools,
+                            explain=bool(parsed[0].explain))
                         scored = [row]
                         tokens = row["input_tokens"]
                     results = [errors.get(slot) for slot in range(len(requests))]

@@ -149,9 +149,12 @@ def split_detect_payload(payload):
     tools = payload.get("tools")
     composer_profile = payload.get("composer_profile")
     enabled_risks = payload.get("enabled_risks")
-    extra = set(payload) - {"messages", "tools", "composer_profile", "enabled_risks"}
+    explain = payload.get("explain", False)
+    extra = set(payload) - {"messages", "tools", "composer_profile", "enabled_risks", "explain"}
     if extra:
         raise ValueError("unexpected fields: %s" % ", ".join(sorted(extra)))
+    if not isinstance(explain, bool):
+        raise ValueError("explain must be a boolean")
     if composer_profile is not None and (not isinstance(composer_profile, str) or not composer_profile):
         raise ValueError("composer_profile must be a non-empty string")
     if enabled_risks is not None:
@@ -162,9 +165,9 @@ def split_detect_payload(payload):
     # 二维（元素是列表）→ 批量；否则单条
     if all(isinstance(item, list) for item in messages):
         requests = [{"messages": item, "tools": tools, "composer_profile": composer_profile,
-                     "enabled_risks": enabled_risks} for item in messages]
+                     "enabled_risks": enabled_risks, "explain": explain} for item in messages]
         return requests, tools, True
     if any(isinstance(item, list) for item in messages):
         raise ValueError("messages is neither a single message list nor a batch")
     return [{"messages": messages, "tools": tools, "composer_profile": composer_profile,
-             "enabled_risks": enabled_risks}], tools, False
+             "enabled_risks": enabled_risks, "explain": explain}], tools, False
