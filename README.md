@@ -345,6 +345,21 @@ HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为
 
 > 仅加载可信来源的 checkpoint；当前加载器使用 PyTorch pickle 反序列化。上下文规则应以训练配置为依据，不应通过调整前缀来迎合几条测试样本的分数。
 
+## Observation-block attention 探针（v3）
+
+除 v2 线性探针外，服务还能加载 ipi-doom 训练的 observation-block attention 探针：manifest 的 `schema` 为 `fyh.probe_checkpoint.v3`，配合 profile `observation_blocks_v3`。
+
+与线性探针的区别：
+
+- **位置逐请求动态生成**。编译器（[`observation_blocks.py`](<inscope_server/observation_blocks.py>)）把对话切成 observation block，每个 block 一个采集位置，外加一个 empty anchor。探针没有静态 `selected_positions`，所以 **一个实例只能服务一个这类风险**，不能和 `INSCOPE_PROBES` 一起用（启动期拒绝）。
+- **编译与打分逐字移植 ipi-doom**，以黄金样本对拍（[测试](<tests/test_observation_blocks_parity.py>)）：compiled text、token_ids、采集位置、block 元数据逐字节一致；logit 和 explain 通道与 `ProbeScorer.score_features` 的差在 1e-5 以内。ipi-doom 改编译或打分规则后，须用 [`generate_ob_blocks_goldens.py`](<tests/generate_ob_blocks_goldens.py>) 重新生成黄金样本。
+- **特征路径**：引擎返回的 BF16 特征 → 逐行 E4M3 量化（FP16 scale）→ 解码 → mean/std → attention。量化往返是刻意保留的，用来复现训练时的存储损失。
+- **层号**：`inscope_layers` 为 `[8, 16, 24]`，`layer_semantics: native_residual_stream_boundary`，直接作边界号使用，**不做 +1**。
+- **empty anchor 参与 attention**（`empty_anchor: attend`），explain 通道里也保留它，不置零——与训练侧一致。
+- **阈值**：manifest 声明 logit 空间阈值（`threshold_space: logit`），对外按 sigmoid 换算成概率。
+
+请求 `"explain": true` 时，`/detect` 额外返回 `blocks`（每个 block 附 `attention_weight` / `attention_contribution`）、`coordinate_system: "compiled_messages"`、`compiled_context`、`capture_positions` 和 `importance_semantics`。这些通道是 block 的相对重要度，**不是各 block 的 IPI 概率**；坐标指向编译后的消息序列，不是原始请求的消息序号。
+
 ## 开发与验证
 
 在仓库根目录执行：
@@ -356,7 +371,7 @@ python -m pytest -q
 
 代码分为三个包：`inscope_contract`（共享契约）、`inscope_server`（服务端）、`inscope`（客户端）。服务端和客户端各自依赖 contract，互不导入；[架构测试](<tests/test_architecture.py>)检查该约束。
 
-现有单元测试无需 GPU；真实端到端验证另需模型、探针与引擎。少量样本跑通不等于检出率、误报率或训练侧数值一致性已验证。具体实验、部署记录及待办见 [交接文档](<HANDOFF.md>)。
+现有单元测试无需 GPU；observation-block 对拍测试需要本机的 Qwen3 tokenizer，缺少时自动跳过。真实端到端验证另需模型、探针与引擎。少量样本跑通不等于检出率、误报率或训练侧数值一致性已验证。具体实验、部署记录及待办见 [交接文档](<HANDOFF.md>)。
 
 ## License
 

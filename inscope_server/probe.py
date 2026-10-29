@@ -22,6 +22,8 @@ LAYER_HIDDEN = 4096
 
 # 支持的 checkpoint schema -> 归一化字段名所在位置。
 SUPPORTED_SCHEMAS = ("fyh.probe_checkpoint.v2",)
+# observation_blocks 布局的 1-head attention 探针（manifest 为权威来源）。
+BLOCK_SCHEMA = "fyh.probe_checkpoint.v3"
 
 
 class ProbeSpec:
@@ -219,6 +221,13 @@ def load_probe(ckpt_path, *, expected_input_dim: int | None = None) -> Probe:
             raise ValueError(
                 "Checkpoint sha256 mismatch: manifest=%s actual=%s" % (declared, digest)
             )
+
+    if manifest and manifest.get("schema") == BLOCK_SCHEMA:
+        from .block_probe import load_block_probe
+        probe_id = manifest.get("probe_id")
+        if not probe_id:
+            raise ValueError("Block checkpoint manifest declares no probe_id")
+        return load_block_probe(path, manifest, probe_id)
 
     ck = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(ck, dict):

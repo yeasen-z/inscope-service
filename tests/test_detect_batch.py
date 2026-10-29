@@ -43,7 +43,8 @@ def test_http_detect_batch_isolates_failures():
         text = "".join(str(m.get("content") or "") for m in messages)
         if text == "boom":
             raise ValueError("cannot tokenize")
-        return [1, 2, 3, 4, 5], {"profile_id": "p"}
+        # 第三个返回值是采集计划；None 表示沿用固定位置（非 observation_blocks）。
+        return [1, 2, 3, 4, 5], {"profile_id": "p"}, None
 
     scoring_module.ScoringPipeline.prepare = prepare
     try:

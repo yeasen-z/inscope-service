@@ -37,7 +37,8 @@ class ComposerProfile:
     composer: ComposerConfig | None = None
     # 是否在 mask 前给 prompt 加固定探测问题（来自探针训练时的 gauge）
     probe_prefix: str = ""
-    # 位置语义：'last' = 完整输入最后一个 token
+    # 位置语义：'last' = 完整输入最后一个 token；'blocks' = 每次请求由
+    # observation-block 编译器动态产出 capture positions（无静态位置声明）
     position_mode: str = "last"
     # 额外的不变量，用于启动期自检
     invariants: Mapping[str, Any] = field(default_factory=dict)
@@ -47,7 +48,7 @@ class ComposerProfile:
             raise ValueError("profile needs profile_id and version")
         if not self.probe_id:
             raise ValueError("profile must declare probe_id (no implicit default)")
-        if self.position_mode not in ("last",):
+        if self.position_mode not in ("last", "blocks"):
             raise ValueError(f"unsupported position_mode {self.position_mode!r}")
 
     def describe(self) -> dict[str, Any]:
@@ -140,6 +141,33 @@ PROFILES = {
     "a5_simplified_v1": _a5_simplified_v1,
     "a6_nemotron_risk_faced_v1": _a6_nemotron_risk_faced_v1,
 }
+
+
+def _observation_blocks_v3() -> ComposerProfile:
+    """observation-block 1-head attention 探针（fyh.probe_checkpoint.v3）。
+
+    语义 = ipi-doom canonical simplified-v3（observation_blocks.py 逐行移植）：
+    retain 1 assistant turn、discard CoT、merge consecutive assistants、
+    无 final probe suffix、enable_thinking=True；位置不是静态声明，而是每次
+    请求由 block 编译器对每条 observation 的每个空行分隔 block 求末 token，
+    并前置 empty anchor。空 anchor 参与 attention（checkpoint 训练协议）。
+    """
+    return ComposerProfile(
+        profile_id="observation_blocks_v3",
+        version="1",
+        probe_id="attention_block:attention-h1:observation_blocks_retain1_discardcot_merged_v3",
+        description=(
+            "observation-block attention 探针的上下文编排：simplified-v3 编译，"
+            "block 级 capture positions 按请求动态产出，E4M3+scale 存储量化。"
+        ),
+        composer=None,
+        position_mode="blocks",
+        invariants={"feature_layout": "observation_blocks", "empty_anchor": "attend",
+                    "storage_codec": "e4m3_scaled_v1"},
+    )
+
+
+PROFILES["observation_blocks_v3"] = _observation_blocks_v3
 
 
 def get_profile(profile_id: str, *, probe_prefix: str | None = None) -> ComposerProfile:

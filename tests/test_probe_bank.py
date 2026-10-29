@@ -55,7 +55,7 @@ def test_multi_probe_rows_carry_all_scores():
     pipeline.request_probes = {"ipi": primary, "harmful": other}
 
     async def prepare(messages, tools=None):
-        return [1, 2, 3], {"profile_id": "x"}
+        return [1, 2, 3], {"profile_id": "x"}, None
 
     async def capture_batch(ids, layers, positions):
         assert layers == (9, 17)
@@ -104,6 +104,7 @@ def _bank_app(score_for):
     class _Profile:
         profile_id = "a6_nemotron_risk_faced_v1"
         composer = real_profile("a6_nemotron_risk_faced_v1").composer
+        position_mode = real_profile("a6_nemotron_risk_faced_v1").position_mode
 
         def describe(self):
             return real_profile("a6_nemotron_risk_faced_v1").describe()
