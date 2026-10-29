@@ -64,6 +64,9 @@
 三个接口共享编排和 `score_features`，但采集分别走单条/批量方法。
 不要说 analyze 调用了 detect 路由，也不要说它们都经过 `score_ids`。
 `/detect` 单条在多风险模式下改走 `ScoringPipeline.collect`（内部 `backend.capture`），批量仍走 `score_prompts`（`backend.capture_batch`），两者共享 `score_probes_all`。
+
+`observation_blocks` v3 是一个例外分支：`prepare` 使用 `compile_observation_blocks` 生成每个请求自己的采集位置与 block plan；单条与 readiness 经 `capture`/`score_ids`，批量和 analyze 经 `score_prompts`。不同请求的位置集合不同，无法共享批量 `feature_capture` spec，所以该分支逐条 capture；`explain: true` 在已有 attention 结果上附加 blocks，不再发起额外前向。block 的 `message_index` 属于编译后坐标，`source_message_indices` 才是回指原请求消息的映射。
+
 打分流水线暂时保留 FastAPI 错误映射，尚不是与传输完全解耦的领域层。
 
 ## 分析究竟如何工作
@@ -80,6 +83,8 @@
 同一轮可批量评分，不同轮有依赖。`cost.score_batches` 是算法调用评分器的轮数，不是 HTTP 次数。
 当前评分器不返回 `prompt_index`，所以 `model_requests` 为 null，不能据此宣称已检测最终 token 输入坍缩。
 公共前缀有多长由裁剪、模板和删除位置决定，没有固定 90% 的命中保证。
+
+对于 observation-block v3，保留/删除一个片段不仅改变文本，也改变动态 block 计划和 attention softmax 的候选项；全部删空后只留下 empty anchor。因此该分支的 `/analyze` 结果只可用于片段**相对排序**，不能把 phi 绝对值解释为可比较的风险分数或因果贡献。要展示块级证据，使用 `/detect` 的 `explain: true`；其 `attention_weight` / `attention_contribution` 是同一次打分的累积前缀证据，而非 IPI 概率。
 
 ## HTTP 引擎与现场 ZMQ 服务是两回事
 
@@ -107,9 +112,7 @@
 
 ### 尚未验收的部分
 
-三个业务接口均在真实引擎上跑通并有一轮性能测量（见 [实测性能](<performance.md>)），
-但以下仍未完成：并发下的表现（测量均为单请求串行）、GPU 采集数值与训练侧缓存的一致性、
-以及检出率/误报率评估。跑通不等于生产就绪。
+三个业务接口均在真实引擎上跑通并有一轮性能测量（见 [实测性能](<performance.md>)）。observation-block v3 另完成了一次真实单条 prefill 的训练侧对拍：编译文本、采集位置、block 元数据相同，logit 与 attention explain 通道的最大差为 `0`。但以下仍未完成：并发下的表现（测量均为单请求串行）、v3 的多请求 batch/radix-cache/chunked-prefill 组合、v3 下 audit/analyze 的逐位训练侧对拍，以及独立的检出率/误报率复现。跑通不等于生产就绪。
 
 ## 维护规则
 

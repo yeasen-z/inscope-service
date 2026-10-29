@@ -71,8 +71,8 @@ python -m pip install ".[server]"
 
 1. **模型与 tokenizer**：当前服务校验的是 Qwen3-8B-FP8，需提供本地权重目录。
 2. **sglang-inscope 引擎**：与服务使用相同模型，启动时启用 `SGLANG_ENABLE_FEATURE_CAPTURE=1`；普通 SGLang 不保证支持特征接口。
-3. **可信的探针 checkpoint**：当前已验证 `fyh.probe_checkpoint.v2` 线性探针；如有配套 `manifest.json`，放在权重同目录。
-4. **匹配的 Composer profile**：必须与探针训练时的上下文处理规则一致，不能仅凭名称或位置数选择。
+3. **可信的探针 checkpoint 与 `manifest.json`**：已验证两种架构：`fyh.probe_checkpoint.v2` 固定位置线性探针，以及 `fyh.probe_checkpoint.v3` observation-block attention 探针。manifest 必须与权重同目录，用于校验权重摘要、层语义、特征布局和阈值。
+4. **匹配的 Composer profile**：必须与探针训练时的上下文处理规则一致，不能仅凭名称或位置数选择。v3 必须使用 `observation_blocks_v3`；它的块编译规则是训练定义的一部分。
 
 服务不会自动启动引擎。下面假定引擎已监听 `http://127.0.0.1:31100`。
 
@@ -125,7 +125,7 @@ curl --fail-with-body http://127.0.0.1:8302/detect \
   -d '{"messages":[{"role":"user","content":"Please summarize this report."}]}'
 ```
 
-`/health/ready` 会实际执行一次特征采集与探针打分，不只是检查端口。
+`/health/ready` 会实际执行一次特征采集与探针打分，不只是检查端口。对于 observation-block 探针，它使用一组含 assistant 工具动作和后续 observation 的就绪样本，以验证动态块编译、位置采集和 attention 打分链路。
 
 ## Python SDK
 
@@ -190,6 +190,8 @@ asyncio.run(main())
 | `composer_profile` / `composer` | 使用的 profile ID 与编排配置 |
 | `checkpoint_sha256` | 权重文件摘要，用于追踪具体文件 |
 | `request_id` / `latency_ms` | 请求标识与服务端处理耗时；`latency_ms` 在单风险模式是数字，多风险模式是含 `total` 的映射 |
+| `blocks`（仅 `explain: true`） | observation-block 探针的 empty anchor 和 observation block；每项包含 attention 权重、对 logit 的贡献以及来源消息映射 |
+| `importance_semantics`（仅 `explain: true`） | 固定为 `cached cumulative-prefix evidence, not IPI probabilities`；权重/贡献是探针池化证据，**不是 block 独立的 IPI 概率** |
 
 **当前接口仍有提示注入场景的历史命名**：`label` 使用 `attack` / `benign`，`risk` 固定为 `indirect_prompt_injection`。这些字段目前没有随探针任务动态变化，不能据此宣称服务已支持任意任务语义。接入其他任务时，需要同时适配输出标签与任务元信息；仅替换权重不会自动完成这一步。
 
@@ -345,7 +347,7 @@ HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为
 
 更换步骤：准备权重及配套元信息 → 选择或实现匹配的 profile → 修改环境变量 → 运行自检 → 重启并验证就绪及代表性样本。
 
-**不能承诺任意 checkpoint 换文件即可运行。** 当前实现以 Qwen3-8B-FP8、hidden size 4096、标准归一化和 `[batch, layer, token, hidden]` 铺平顺序为基础，已验证的是 v2 线性探针。新架构、新编排策略需要实现与验证；保留的 `a5_simplified_v1` profile 不代表已支持 A5 blend 权重加载。
+**不能承诺任意 checkpoint 换文件即可运行。** 当前实测范围以 Qwen3-8B-FP8、hidden size 4096 为基础，已验证 `fyh.probe_checkpoint.v2` 固定位置线性探针和 `fyh.probe_checkpoint.v3` observation-block attention 探针；二者的特征布局和编排方式不同，不能互换。其他新架构、新编排策略仍需要实现与验证；保留的 `a5_simplified_v1` profile 不代表已支持 A5 blend 权重加载。
 
 层号也必须显式对齐：SGLang 使用 residual-stream **边界号**。若 checkpoint 声明的是零起始 decoder block 输出，`block b` 对应 `boundary b + 1`；若已声明边界号则不转换。优先采用 manifest 的 `inscope_layers`，没有可用语义时拒绝加载。详见 [层号契约](<inscope_contract/layers.py>)。
 
@@ -353,28 +355,42 @@ HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为
 
 ## Observation-block attention 探针（v3）
 
-除 v2 线性探针外，服务还能加载 ipi-doom 训练的 observation-block attention 探针：manifest 的 `schema` 为 `fyh.probe_checkpoint.v3`，配合 profile `observation_blocks_v3`。
+除 v2 固定位置线性探针外，服务还能加载 ipi-doom 训练的 observation-block attention 探针：manifest 的 `schema` 为 `fyh.probe_checkpoint.v3`，配合 profile `observation_blocks_v3`。该版本的目标是**提升 `/detect` 对工具/用户 observation 中间接提示注入的检出能力**；块级 explain 是同一次打分直接产出的证据，不需要另跑定位模型或反事实分析。
 
-与线性探针的区别：
+在同一份 `A5_n4194304` observation-block 特征缓存上的架构对比中，attention pooling 的验证集 macro recall 为 `0.8896`，高于 last-token 基线的 `0.7457`；实际部署的 1-head checkpoint 在 pooled test 上的 recall 为 `0.9204`、FPR 为 `0.0066`，相对 last-token 的 `0.8010` recall、`0.0209` FPR。这些是训练/评测记录，不是当前生产请求的效果保证；具体 checkpoint、阈值和验证范围以相邻 manifest 为准。
 
-- **位置逐请求动态生成**。编译器（[`observation_blocks.py`](<inscope_server/observation_blocks.py>)）把对话切成 observation block，每个 block 一个采集位置，外加一个 empty anchor。探针没有静态 `selected_positions`，所以 **一个实例只能服务一个这类风险**，不能和 `INSCOPE_PROBES` 一起用（启动期拒绝）。
-- **编译与打分逐字移植 ipi-doom**，以黄金样本对拍（[测试](<tests/test_observation_blocks_parity.py>)）：compiled text、token_ids、采集位置、block 元数据逐字节一致；logit 和 explain 通道与 `ProbeScorer.score_features` 的差在 1e-5 以内。ipi-doom 改编译或打分规则后，须用 [`generate_ob_blocks_goldens.py`](<tests/generate_ob_blocks_goldens.py>) 重新生成黄金样本。
-- **特征路径**：引擎返回的 BF16 特征 → 逐行 E4M3 量化（FP16 scale）→ 解码 → mean/std → attention。量化往返是刻意保留的，用来复现训练时的存储损失。
+### 运行与训练侧对齐
+
+- **位置逐请求动态生成**。编译器（[`observation_blocks.py`](<inscope_server/observation_blocks.py>)）按训练定义把对话编译成 observation block：每个非空的双换行段落对应一个采集位置，另有一个 empty anchor。没有静态 `selected_positions`，因此 **一个实例只能服务一个这类风险**，不能和 `INSCOPE_PROBES` 一起用（启动期拒绝）。
+- **编译与打分逐字移植 ipi-doom**，以黄金样本对拍（[测试](<tests/test_observation_blocks_parity.py>)）：compiled text、token IDs、采集位置、block 元数据逐字节一致；服务还用真实引擎完成了 compile → capture → quantize → attention → threshold 对拍，记录的 logit、attention weight 与 contribution 最大差均为 `0`。该实测覆盖单条 prefill（211 tokens、4 个 capture slot），尚未覆盖多请求 batch、radix cache、chunked prefill、FP8/BF16 数值组合，也未将 audit/analyze 纳入逐位对拍。ipi-doom 改编译或打分规则后，须用 [`generate_ob_blocks_goldens.py`](<tests/generate_ob_blocks_goldens.py>) 重新生成黄金样本并重跑真实引擎对拍。
+- **特征路径**：引擎 BF16 特征 → 按 **每个 `(layer, position)`** 的最后一维计算 FP16 scale → E4M3 编码/解码 → mean/std → attention。量化往返刻意保留，以复现训练特征的存储损失；不能将 3 个层拼接后只用一个 scale。
 - **层号**：`inscope_layers` 为 `[8, 16, 24]`，`layer_semantics: native_residual_stream_boundary`，直接作边界号使用，**不做 +1**。
-- **empty anchor 参与 attention**（`empty_anchor: attend`），explain 通道里也保留它，不置零——与训练侧一致。
-- **阈值**：manifest 声明 logit 空间阈值（`threshold_space: logit`），对外按 sigmoid 换算成概率。
+- **empty anchor 参与 attention**（`empty_anchor: attend`）。它既进入 softmax，也保留在 explain 输出中；不得为展示目的掩蔽或置零。
+- **阈值**：checkpoint 的阈值为 logit `3.7808122634887695`；服务将它 sigmoid 换算为 probability `0.9777042865753174`，并在 probability 空间做 `attack` / `benign` 判定。
 
-请求 `"explain": true` 时，`/detect` 额外返回 `blocks`（每个 block 附 `attention_weight` / `attention_contribution`）、`coordinate_system: "compiled_messages"`、`compiled_context`、`capture_positions` 和 `importance_semantics`。这些通道是 block 的相对重要度，**不是各 block 的 IPI 概率**；`start`/`end` 是编译后消息正文里的字符偏移。
+### `/detect` explain：块级证据与原始消息映射
 
-块级定位要指回调用方自己的消息，用 `blocks[].source_message_indices`：编译会做两件改变
-序号的事，所以这条映射无法靠下标相等推出来——
+请求 `"explain": true` 时，`/detect` 额外返回：
 
-- `retain_n_assistant_turns` 选窗会**丢掉**更早的 turn，编译后序号因此整体前移；
-- `merge_consecutive_assistants` 会把连续 assistant 并成一条，一个 block 因此对应**多条**原始消息。
+- `blocks`：empty anchor 和每个 observation block。每个 block 有 `kind`、编译消息内的 `start` / `end` 字符偏移、`capture_slot`、`attention_weight` 和 `attention_contribution`；`attention_contribution` 是该块对最终 **logit** 的 attention 加权证据。
+- `coordinate_system: "compiled_messages"`、`compiled_context`、`capture_positions`：用来审计服务实际编译、实际采集的上下文；`start` / `end` **不是**原请求全文偏移。
+- `importance_semantics: "cached cumulative-prefix evidence, not IPI probabilities"`：attention weight 和 contribution 只能用于当前一次已编译上下文内的相对解释，**不能**当作每个块独立的 IPI 概率、因果归因或跨请求可比的风险分数。
 
-`message_index` 与 `source_message_indices` 同时返回，两者都在同一次编译里算出（
-[composer.py](<inscope_server/composer.py>) 的 `retained_message_indices` 与
-[observation_blocks.py](<inscope_server/observation_blocks.py>) 的 `message_sources`）。
+块级定位要指回调用方自己的消息，使用 `blocks[].source_message_indices`，不要把 `message_index` 当作原始请求下标：
+
+- `retain_n_assistant_turns` 选窗会**丢掉**更早的 turn，编译后的 `message_index` 会整体前移；
+- `merge_consecutive_assistants` 会把连续 assistant 合成一个编译消息，一个 block 因而可以对应**多条**原始消息；
+- 一个 observation 的双换行段落会分别成为多个 block，但这些 block 会共享其来源消息下标。
+
+`message_index` 与 `source_message_indices` 同时在同一次编译中生成（[composer.py](<inscope_server/composer.py>) 的 `retained_message_indices` 与 [observation_blocks.py](<inscope_server/observation_blocks.py>) 的 `message_sources`）。例如，CoolWatch 应以 `source_message_indices` 找回原请求正文，再以 `start` / `end` 在对应 observation 的内容中展示命中段落。
+
+### 与 `/analyze` 的关系
+
+`/analyze` 是原有的通用反事实定位接口，**没有为 v3 改写**，仍兼容调用。它通过删/留 observation 片段、重新打分来计算相对排序；对 v3 而言，这个干预会同时增删 block 和 attention softmax 的候选项。特别是删掉所有片段后只会留下 empty anchor，产生训练未覆盖的退化基线。因此：
+
+- `/detect` 的 `explain` 是 v3 的首选块级解释，额外前向次数为零；
+- `/analyze` 在 v3 上可以用于**相对排序**，但其 phi 的绝对量级不可解释，不应用作块级告警分数或与 `/detect` 分数比较；
+- `/analyze` 的 API、策略和返回结构仍是旧版语义，未作为本次 detect 效果提升的一部分重新验证；`/audit` 同样未在 v3 下做完整验证。
 
 ## 开发与验证
 
