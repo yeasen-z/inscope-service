@@ -77,7 +77,8 @@ def main():
     checks.append(("capture_positions", list(compiled.positions) == list(response["capture_positions"])))
     blocks = [dict(block) for block in compiled.blocks]
     service_blocks = [{key: value for key, value in block.items()
-                       if key not in ("attention_weight", "attention_contribution")}
+                       if key not in ("attention_weight", "attention_contribution",
+                                      "source_message_indices")}
                       for block in response["blocks"]]
     checks.append(("blocks", blocks == service_blocks))
     print("[compile] text=%s positions=%s blocks=%s"
