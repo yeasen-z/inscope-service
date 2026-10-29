@@ -135,6 +135,20 @@ class ScoringPipeline:
         except ValueError as exc:
             raise HTTPException(503, "Invalid InScope features or score") from exc
 
+    def explained_blocks(self, explained, plan):
+        """给每个 block 补上它来自哪条原始请求消息。
+
+        ``message_index`` 属于 compiled_messages 坐标系；选窗会丢消息、合并会把
+        多条 assistant 并成一条，所以指回请求必须显式映射，不能靠下标相等。
+        """
+        sources = getattr(plan, "message_sources", ())
+        blocks = []
+        for block in explained["blocks"]:
+            index = block["message_index"]
+            origin = sources[index] if index < len(sources) else ()
+            blocks.append(dict(block, source_message_indices=list(origin)))
+        return blocks
+
     def probe_layers(self, probe, features):
         """从共享采集结果取出本探针的层块；features 是 {layer: [hidden]} 或层列表。"""
         if not isinstance(features, dict):
@@ -267,7 +281,7 @@ class ScoringPipeline:
                    # token 数随行返回：/detect 的单条与批量路径都要给出同一组字段。
                    "input_tokens": len(ids)}
             if explained is not None and "blocks" in explained:
-                row.update(blocks=explained["blocks"],
+                row.update(blocks=self.explained_blocks(explained, plan),
                            coordinate_system="compiled_messages",
                            compiled_context=plan.text,
                            capture_positions=list(plan.positions),
@@ -372,7 +386,7 @@ class ScoringPipeline:
                    "label": "attack" if probability >= primary.threshold else "benign",
                    "input_tokens": len(ids)}
             if explain and explained is not None and "blocks" in explained:
-                row.update(blocks=explained["blocks"],
+                row.update(blocks=self.explained_blocks(explained, plan),
                            coordinate_system="compiled_messages",
                            compiled_context=plan.text,
                            capture_positions=list(plan.positions),

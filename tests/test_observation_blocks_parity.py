@@ -122,3 +122,51 @@ def test_threshold_is_sigmoid_of_logit(block_probe):
     assert block_probe.threshold == pytest.approx(
         float(torch.sigmoid(torch.tensor(3.7808122634887695))), abs=1e-7)
     assert block_probe.capture_layers == (8, 16, 24)
+
+
+def test_message_sources_map_blocks_back_to_request(goldens, tokenizer):
+    """块级定位必须能指回原始请求：编译会丢旧 turn、会合并连续 assistant。"""
+    from inscope_server.observation_blocks import compile_observation_blocks
+    for case in goldens["cases"]:
+        request = case["request"]
+        compiled = compile_observation_blocks(tokenizer, request["messages"],
+                                             request.get("tools"))
+        assert len(compiled.message_sources) > max(
+            block["message_index"] for block in compiled.blocks), case["name"]
+        for index, sources in enumerate(compiled.message_sources):
+            assert sources, (case["name"], index)
+            assert all(0 <= source < len(request["messages"]) for source in sources)
+            role = request["messages"][sources[0]]["role"]
+            if role == "developer":
+                role = "system"
+            assert role in ("system", "user", "assistant", "tool")
+        flattened = [source for sources in compiled.message_sources for source in sources]
+        assert flattened == sorted(flattened), "映射必须保持请求顺序"
+        for block in compiled.blocks:
+            assert compiled.message_sources[block["message_index"]], case["name"]
+
+
+def test_message_sources_handle_dropped_and_merged(tokenizer):
+    """两个真实失真来源：选窗丢消息造成位移，合并 assistant 造成一对多。"""
+    from inscope_server.observation_blocks import compile_observation_blocks
+    dropped = compile_observation_blocks(tokenizer, [
+        {"role": "user", "content": "task one"},
+        {"role": "assistant", "content": "done one"},
+        {"role": "user", "content": "task two"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c2", "type": "function",
+             "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c2", "name": "read", "content": "B1"},
+    ])
+    assert dropped.message_sources == ((0,), (3,), (4,))
+    assert {block["message_index"] for block in dropped.blocks} == {2}
+
+    merged = compile_observation_blocks(tokenizer, [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "thinking out loud"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c3", "type": "function",
+             "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c3", "name": "read", "content": "C1"},
+    ])
+    assert merged.message_sources == ((0,), (1, 2), (3,))

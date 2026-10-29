@@ -358,7 +358,17 @@ HTTP 监听地址与端口可用 `--host` / `--port` 指定。不传时默认为
 - **empty anchor 参与 attention**（`empty_anchor: attend`），explain 通道里也保留它，不置零——与训练侧一致。
 - **阈值**：manifest 声明 logit 空间阈值（`threshold_space: logit`），对外按 sigmoid 换算成概率。
 
-请求 `"explain": true` 时，`/detect` 额外返回 `blocks`（每个 block 附 `attention_weight` / `attention_contribution`）、`coordinate_system: "compiled_messages"`、`compiled_context`、`capture_positions` 和 `importance_semantics`。这些通道是 block 的相对重要度，**不是各 block 的 IPI 概率**；坐标指向编译后的消息序列，不是原始请求的消息序号。
+请求 `"explain": true` 时，`/detect` 额外返回 `blocks`（每个 block 附 `attention_weight` / `attention_contribution`）、`coordinate_system: "compiled_messages"`、`compiled_context`、`capture_positions` 和 `importance_semantics`。这些通道是 block 的相对重要度，**不是各 block 的 IPI 概率**；`start`/`end` 是编译后消息正文里的字符偏移。
+
+块级定位要指回调用方自己的消息，用 `blocks[].source_message_indices`：编译会做两件改变
+序号的事，所以这条映射无法靠下标相等推出来——
+
+- `retain_n_assistant_turns` 选窗会**丢掉**更早的 turn，编译后序号因此整体前移；
+- `merge_consecutive_assistants` 会把连续 assistant 并成一条，一个 block 因此对应**多条**原始消息。
+
+`message_index` 与 `source_message_indices` 同时返回，两者都在同一次编译里算出（
+[composer.py](<inscope_server/composer.py>) 的 `retained_message_indices` 与
+[observation_blocks.py](<inscope_server/observation_blocks.py>) 的 `message_sources`）。
 
 ## 开发与验证
 

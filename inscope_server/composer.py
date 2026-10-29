@@ -86,6 +86,26 @@ def compose_prompt(tokenizer, messages, tools=None, config: ComposerConfig | Non
     return ComposedPrompt(text=template_text + (config.probe_prefix or ""), token_ids=tuple(token_ids))
 
 
+def retained_message_indices(messages: Sequence[Mapping[str, Any]], retain_n_assistant_turns: int):
+    """``select_prompt_messages`` 选中哪些原始下标；两者共用同一套判定。
+
+    编译后的消息序号经过选窗与合并后不再等于请求里的序号，块级定位需要
+    这条映射才能指回调用方原本的消息。
+    """
+    if retain_n_assistant_turns == -1 or retain_n_assistant_turns < 1:
+        return list(range(len(messages)))
+    starts = [i for i, message in enumerate(messages)
+              if message.get("role") == "assistant" and
+              (i == 0 or messages[i - 1].get("role") != "assistant")]
+    if not starts:
+        return list(range(len(messages)))
+    cutoff = starts[max(0, len(starts) - retain_n_assistant_turns)]
+    opening_end = starts[0]
+    return [i for i, message in enumerate(messages)
+            if i < opening_end or i >= cutoff or
+            message.get("role") in ("system", "developer")]
+
+
 def select_prompt_messages(messages: Sequence[Mapping[str, Any]], retain_n_assistant_turns: int):
     """保留开场任务/指令与最后 N 个完整 agent turn。
 
@@ -97,16 +117,7 @@ def select_prompt_messages(messages: Sequence[Mapping[str, Any]], retain_n_assis
         return list(messages)
     if retain_n_assistant_turns < 1:
         raise ValueError("retain_n_assistant_turns must be -1 or positive")
-    starts = [i for i, message in enumerate(messages)
-              if message.get("role") == "assistant" and
-              (i == 0 or messages[i - 1].get("role") != "assistant")]
-    if not starts:
-        return list(messages)
-    cutoff = starts[max(0, len(starts) - retain_n_assistant_turns)]
-    opening_end = starts[0]
-    return [message for i, message in enumerate(messages)
-            if i < opening_end or i >= cutoff or
-            message.get("role") in ("system", "developer")]
+    return [messages[i] for i in retained_message_indices(messages, retain_n_assistant_turns)]
 
 
 def drop_final_tool_result(messages: Sequence[Mapping[str, Any]]):

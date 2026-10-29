@@ -84,7 +84,8 @@ class DetectionResult(BaseModel):
     bank_version: str | None = None
     scores: dict[str, tuple[float, float]] | None = None
     # observation_blocks 探针的 explain 输出（仅 explain=true 时出现）。
-    # blocks[].message_index 属于 compiled_messages 坐标系，见 coordinate_system。
+    # blocks[].message_index 属于 compiled_messages 坐标系，见 coordinate_system；
+    # blocks[].source_message_indices 指回原始请求里的消息下标。
     blocks: list[dict[str, Any]] | None = None
     coordinate_system: Literal["compiled_messages"] | None = None
     compiled_context: str | None = None
