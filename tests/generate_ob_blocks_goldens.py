@@ -10,6 +10,7 @@ import base64
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, "/mnt/kpfs_qyang/djs/ipi-doom/src")
 sys.path.insert(0, "/mnt/kpfs_qyang/djs/ipi-doom")
@@ -19,7 +20,6 @@ from transformers import AutoTokenizer
 
 from follow_your_heart.data_collection.schema import DecisionPointRecord
 from featurize.observation_blocks import build_block_prompt
-from featurize.feature_quantization import encode_scaled_e4m3
 from probe_training.debug import ProbeScorer
 
 MODEL = "/mnt/kpfs_qyang/djs/models/Qwen3-8B-FP8"
@@ -122,13 +122,18 @@ def main():
     records = []
     for index, (name, request) in enumerate(CASES):
         compiled = build_block_prompt(point(request, index), tokenizer=tokenizer)
-        raw = torch.randn(len(compiled.positions), 12288,
-                          generator=torch.Generator().manual_seed(20261029 + index)) * 2.0
-        packed, scales = encode_scaled_e4m3(raw)
-        decoded = packed.float() * scales.float().unsqueeze(-1)
-        explained = scorer.score_features([decoded], blocks=[list(compiled.blocks)],
-                                          explain=True)[0]
+        # 训练侧的真实布局：逐层 [positions, hidden]，量化按 (layer, position)。
+        # 直接用 _score_features（含量化往返与 transpose/flatten/slots 取行），
+        # 不在这里重写任何一步，黄金样本才不是「我以为的」训练路径。
+        generator = torch.Generator().manual_seed(20261029 + index)
+        hidden_states = [torch.randn(len(compiled.positions), 4096, generator=generator) * 2.0
+                         for _ in SPEC["layers"]]
+        capture = SimpleNamespace(layer_ids=tuple(SPEC["layers"]), hidden_states=hidden_states)
+        explained = scorer._score_features([capture], blocks=[list(compiled.blocks)],
+                                           explain=True)[0]
         channels = explained["component_importance"][0]["channels"]
+        # 服务端收到的是一整行 [n_slots, layers*hidden]，与 stack(dim=1).reshape 同序。
+        rows = torch.stack(hidden_states, dim=1).reshape(len(compiled.positions), -1)
         records.append({
             "name": name,
             "request": request,
@@ -137,7 +142,7 @@ def main():
             "positions": list(compiled.positions),
             "blocks": [dict(block) for block in compiled.blocks],
             "raw_features_f32_b64": base64.b64encode(
-                raw.numpy().astype("<f4").tobytes()).decode("ascii"),
+                rows.numpy().astype("<f4").tobytes()).decode("ascii"),
             "expected_logit": explained["logit"],
             "expected_attention_weight": channels["attention_weight"],
             "expected_attention_contribution": channels["attention_contribution"],

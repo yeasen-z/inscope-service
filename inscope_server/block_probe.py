@@ -103,6 +103,11 @@ class BlockProbeHandle:
         return float(torch.sigmoid(torch.tensor(self.threshold_logit)).item())
 
     @property
+    def input_dim(self) -> int:
+        """与线性探针同名：供 /info、自检与日志统一读取。"""
+        return int(self.spec.input_dim)
+
+    @property
     def capture_layers(self) -> Sequence[int]:
         return self.spec.capture_layers
 
@@ -121,8 +126,12 @@ class BlockProbeHandle:
             raise ValueError("Block feature rows have shape %s" % (tuple(rows.shape),))
         if not torch.isfinite(rows).all():
             raise ValueError("Feature tensor contains non-finite values")
-        packed, scales = encode_scaled_e4m3(rows)
-        decoded = packed.float() * scales.float().unsqueeze(-1)
+        # 训练侧按 [layer, position, hidden] 逐 (layer, position) 求 absmax
+        # （plan.json: per-layer/per-position float16 scale）。这里必须先还原层
+        # 维度再量化，否则会退化成「每个 capture slot 一个 scale」，数值对不上。
+        layered = rows.reshape(rows.shape[0], len(self.capture_layers), LAYER_HIDDEN)
+        packed, scales = encode_scaled_e4m3(layered)
+        decoded = (packed.float() * scales.float().unsqueeze(-1)).reshape(rows.shape[0], -1)
         slots = [int(block['capture_slot']) for block in blocks]
         if any(slot >= decoded.shape[0] for slot in slots):
             raise ValueError("Block capture_slot exceeds captured rows")
@@ -243,7 +252,7 @@ def load_block_probe(path: Path, manifest: dict, probe_id: str) -> BlockProbeHan
         capture_layers=layers,
         selected_positions=(),
         feature_normalization="standard",
-        flatten_order=(),
+        flatten_order=tuple(manifest.get("flatten_order") or ("layer", "hidden")),
         threshold=float(torch.sigmoid(torch.tensor(threshold_logit)).item()),
         labeling_protocol=ck.get("labeling_protocol"),
         probe_prefix="",

@@ -76,16 +76,31 @@ def test_compile_matches_ipi_doom(tokenizer, goldens):
 
 
 def test_score_matches_ipi_doom(block_probe, goldens):
+    """同一份特征下服务与训练侧必须逐位一致：量化分组、归一化、attention 全在路径上。"""
     import torch
     for case in goldens["cases"]:
         raw = torch.from_numpy(_raw_features(case).copy())
         scored = block_probe.score_blocks(raw, case["blocks"], explain=True)
-        assert scored["logit"] == pytest.approx(case["expected_logit"], abs=1e-5), case["name"]
+        assert scored["logit"] == pytest.approx(case["expected_logit"], abs=1e-6), case["name"]
         weight = [block["attention_weight"] for block in scored["blocks"]]
         contribution = [block["attention_contribution"] for block in scored["blocks"]]
-        assert weight == pytest.approx(case["expected_attention_weight"], abs=1e-5), case["name"]
+        assert weight == pytest.approx(case["expected_attention_weight"], abs=1e-9), case["name"]
         assert contribution == pytest.approx(
-            case["expected_attention_contribution"], abs=1e-5), case["name"]
+            case["expected_attention_contribution"], abs=1e-9), case["name"]
+
+
+def test_quantization_is_per_layer_not_per_slot(block_probe, goldens):
+    """回归：E4M3 scale 必须按 (layer, position) 分组，不能整行 12288 维共用一个。"""
+    import torch
+    case = goldens["cases"][0]
+    raw = torch.from_numpy(_raw_features(case).copy())
+    scored = block_probe.score_blocks(raw, case["blocks"])
+    layered = raw.reshape(raw.shape[0], len(block_probe.capture_layers), -1)
+    from inscope_server.block_probe import encode_scaled_e4m3
+    packed, scales = encode_scaled_e4m3(layered)
+    assert scales.shape == (raw.shape[0], len(block_probe.capture_layers))
+    assert scales.shape != (raw.shape[0],) and scales.shape != (raw.shape[0], 1)
+    assert abs(scored["logit"] - case["expected_logit"]) < 1e-6
 
 
 def test_empty_anchor_attends_like_training(block_probe, goldens):

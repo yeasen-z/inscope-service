@@ -129,7 +129,8 @@ class ScoringPipeline:
             log.warning("Shadow backend failed: %s", type(exc).__name__)
             raise HTTPException(503, "Shadow feature backend unavailable") from exc
         try:
-            scores, _explained = self.score_features_explained(hidden)
+            # block 探针的打分依赖编译产物（动态位置 + block 元数据），必须转发。
+            scores, _explained = self.score_features_explained(hidden, plan)
             return scores
         except ValueError as exc:
             raise HTTPException(503, "Invalid InScope features or score") from exc

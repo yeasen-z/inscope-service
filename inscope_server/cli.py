@@ -52,9 +52,10 @@ def main(argv=None):
 
     log.info("engine=%s model=%s", settings.backend_url, settings.model_path)
     log.info("probe=%s id=%s", settings.probe_checkpoint, probe.spec.probe_id)
+    # block 探针在 spec 上声明维度，线性探针则直接暴露 input_dim。
     log.info("layers=%s positions=%s dim=%d threshold=%.4f",
              list(probe.capture_layers), list(probe.selected_positions),
-             probe.input_dim, probe.threshold)
+             getattr(probe, "input_dim", None) or probe.spec.input_dim, probe.threshold)
     log.info("composer_profile=%s", profile.profile_id)
 
     if args.preflight_only:
