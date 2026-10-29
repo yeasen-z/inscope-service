@@ -76,16 +76,31 @@ def test_compile_matches_ipi_doom(tokenizer, goldens):
 
 
 def test_score_matches_ipi_doom(block_probe, goldens):
+    """同一份特征下服务与训练侧必须逐位一致：量化分组、归一化、attention 全在路径上。"""
     import torch
     for case in goldens["cases"]:
         raw = torch.from_numpy(_raw_features(case).copy())
         scored = block_probe.score_blocks(raw, case["blocks"], explain=True)
-        assert scored["logit"] == pytest.approx(case["expected_logit"], abs=1e-5), case["name"]
+        assert scored["logit"] == pytest.approx(case["expected_logit"], abs=1e-6), case["name"]
         weight = [block["attention_weight"] for block in scored["blocks"]]
         contribution = [block["attention_contribution"] for block in scored["blocks"]]
-        assert weight == pytest.approx(case["expected_attention_weight"], abs=1e-5), case["name"]
+        assert weight == pytest.approx(case["expected_attention_weight"], abs=1e-9), case["name"]
         assert contribution == pytest.approx(
-            case["expected_attention_contribution"], abs=1e-5), case["name"]
+            case["expected_attention_contribution"], abs=1e-9), case["name"]
+
+
+def test_quantization_is_per_layer_not_per_slot(block_probe, goldens):
+    """回归：E4M3 scale 必须按 (layer, position) 分组，不能整行 12288 维共用一个。"""
+    import torch
+    case = goldens["cases"][0]
+    raw = torch.from_numpy(_raw_features(case).copy())
+    scored = block_probe.score_blocks(raw, case["blocks"])
+    layered = raw.reshape(raw.shape[0], len(block_probe.capture_layers), -1)
+    from inscope_server.block_probe import encode_scaled_e4m3
+    packed, scales = encode_scaled_e4m3(layered)
+    assert scales.shape == (raw.shape[0], len(block_probe.capture_layers))
+    assert scales.shape != (raw.shape[0],) and scales.shape != (raw.shape[0], 1)
+    assert abs(scored["logit"] - case["expected_logit"]) < 1e-6
 
 
 def test_empty_anchor_attends_like_training(block_probe, goldens):
@@ -107,3 +122,78 @@ def test_threshold_is_sigmoid_of_logit(block_probe):
     assert block_probe.threshold == pytest.approx(
         float(torch.sigmoid(torch.tensor(3.7808122634887695))), abs=1e-7)
     assert block_probe.capture_layers == (8, 16, 24)
+
+
+def test_message_sources_map_blocks_back_to_request(goldens, tokenizer):
+    """块级定位必须能指回原始请求：编译会丢旧 turn、会合并连续 assistant。"""
+    from inscope_server.observation_blocks import compile_observation_blocks
+    for case in goldens["cases"]:
+        request = case["request"]
+        compiled = compile_observation_blocks(tokenizer, request["messages"],
+                                             request.get("tools"))
+        assert len(compiled.message_sources) > max(
+            block["message_index"] for block in compiled.blocks), case["name"]
+        for index, sources in enumerate(compiled.message_sources):
+            assert sources, (case["name"], index)
+            assert all(0 <= source < len(request["messages"]) for source in sources)
+            role = request["messages"][sources[0]]["role"]
+            if role == "developer":
+                role = "system"
+            assert role in ("system", "user", "assistant", "tool")
+        flattened = [source for sources in compiled.message_sources for source in sources]
+        assert flattened == sorted(flattened), "映射必须保持请求顺序"
+        for block in compiled.blocks:
+            assert compiled.message_sources[block["message_index"]], case["name"]
+
+
+def test_message_sources_handle_dropped_and_merged(tokenizer):
+    """两个真实失真来源：选窗丢消息造成位移，合并 assistant 造成一对多。"""
+    from inscope_server.observation_blocks import compile_observation_blocks
+    dropped = compile_observation_blocks(tokenizer, [
+        {"role": "user", "content": "task one"},
+        {"role": "assistant", "content": "done one"},
+        {"role": "user", "content": "task two"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c2", "type": "function",
+             "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c2", "name": "read", "content": "B1"},
+    ])
+    assert dropped.message_sources == ((0,), (3,), (4,))
+    assert {block["message_index"] for block in dropped.blocks} == {2}
+
+    merged = compile_observation_blocks(tokenizer, [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "thinking out loud"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c3", "type": "function",
+             "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c3", "name": "read", "content": "C1"},
+    ])
+    assert merged.message_sources == ((0,), (1, 2), (3,))
+
+
+def test_prompt_too_long_is_non_template_failure(tokenizer, block_probe):
+    """超长必须可区分：编译期抛 PromptTooLong，HTTP 层映射 413 而不是 422。"""
+    from fastapi import HTTPException
+
+    from inscope_server.observation_blocks import PromptTooLong, compile_observation_blocks
+    from inscope_server.scoring import ScoringPipeline
+    messages = [{"role": "user", "content": "read it"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "name": "read", "content": "A1\n\nA2"}]
+    with pytest.raises(PromptTooLong):
+        compile_observation_blocks(tokenizer, messages, max_prompt_tokens=2)
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from inscope_server.context_profile import get_profile
+
+    pipeline = ScoringPipeline(
+        {"probe": block_probe, "tokenizer": tokenizer, "backend": None},
+        SimpleNamespace(max_tokens=2, max_inflight=1), get_profile("observation_blocks_v3"))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(pipeline.prepare(messages))
+    assert caught.value.status_code == 413

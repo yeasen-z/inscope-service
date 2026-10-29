@@ -24,11 +24,16 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from .composer import _apply_chat_template, _encode_text, select_prompt_messages
+from .composer import (_apply_chat_template, _encode_text, retained_message_indices,
+                       select_prompt_messages)
 
 # 与 ipi-doom featurize/observation_blocks.py SETTING 完全一致。
 SETTING = dict(retain_n_assistant_turns=1, discard_cots=True,
                merge_consecutive_assistants=True, enable_thinking=True, probe_prefix='')
+
+
+class PromptTooLong(ValueError):
+    """编译后的 prompt 超过声明上限；不做截断，交给 HTTP 层映射成 413。"""
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,8 @@ class ObservationBlocks:
     text: str
     positions: tuple[int, ...]
     blocks: tuple[dict, ...]
+    # 编译后 messages 下标 -> 原始请求消息下标（合并 assistant 时一对多）。
+    message_sources: tuple[tuple[int, ...], ...] = ()
 
 
 def block_spans(content: str):
@@ -378,10 +385,17 @@ def _normalize_prompt_message(message: Mapping[str, Any], *, discard_cots: bool 
 
 
 def _normalize_prompt_messages(messages: Sequence[Mapping[str, Any]], *, discard_cots: bool = False,
-                               merge_consecutive_assistants: bool = False) -> list[dict[str, Any]]:
+                               merge_consecutive_assistants: bool = False,
+                               origins: Sequence[int] | None = None,
+                               sources: list[list[int]] | None = None) -> list[dict[str, Any]]:
+    """``sources`` 非 None 时按输出消息逐个记录其来源（origins 为原始请求下标）。
+
+    合并连续 assistant 时一个输出消息对应多个原始下标，所以是列表而非单个整数。
+    """
     normalized = []
-    for message in messages:
+    for position, message in enumerate(messages):
         current = _normalize_prompt_message(message, discard_cots=discard_cots)
+        origin = origins[position] if origins is not None else position
         if (merge_consecutive_assistants and current['role'] == 'assistant' and
                 normalized and normalized[-1]['role'] == 'assistant'):
             previous = normalized[-1]
@@ -390,8 +404,12 @@ def _normalize_prompt_messages(messages: Sequence[Mapping[str, Any]], *, discard
                     previous[key] = previous[key] + '\n' + current[key] if previous.get(key) else current[key]
             if current.get('tool_calls'):
                 previous.setdefault('tool_calls', []).extend(current['tool_calls'])
+            if sources is not None:
+                sources[-1].append(origin)
         else:
             normalized.append(current)
+            if sources is not None:
+                sources.append([origin])
     return normalized
 
 
@@ -404,10 +422,13 @@ def compile_observation_blocks(tokenizer, messages, tools=None, *,
     产物与 ipi-doom featurize.observation_blocks.build_block_prompt 逐项一致：
     同一 compiled text/token_ids、同一 capture positions、同一 block 元数据。
     """
-    selected = select_prompt_messages(messages, SETTING['retain_n_assistant_turns'])
+    selected_indices = retained_message_indices(messages, SETTING['retain_n_assistant_turns'])
+    selected = [messages[i] for i in selected_indices]
+    sources: list[list[int]] = []
     prompt_messages = _normalize_prompt_messages(
         selected, discard_cots=SETTING['discard_cots'],
-        merge_consecutive_assistants=SETTING['merge_consecutive_assistants'])
+        merge_consecutive_assistants=SETTING['merge_consecutive_assistants'],
+        origins=selected_indices, sources=sources)
     for message in prompt_messages:
         if message['role'] == 'developer':
             message['role'] = 'system'
@@ -421,7 +442,7 @@ def compile_observation_blocks(tokenizer, messages, tools=None, *,
         raise ValueError("chat template produced an empty prompt")
     prompt = _Prompt(text=canonical_text, token_ids=token_ids)
     if len(prompt.token_ids) > max_prompt_tokens:
-        raise ValueError('Observation-block prompt exceeds token limit; no truncation')
+        raise PromptTooLong('Observation-block prompt exceeds token limit; no truncation')
     encoded = position_tokenizer(prompt.text, add_special_tokens=False, return_offsets_mapping=True)
     if tuple(encoded['input_ids']) != prompt.token_ids:
         raise ValueError('Offset tokenizer differs from the captured prompt')
@@ -492,4 +513,5 @@ def compile_observation_blocks(tokenizer, messages, tools=None, *,
     for block in blocks:
         block['capture_slot'] = slots[block['token_position']]
     return ObservationBlocks(input_ids=prompt.token_ids, text=prompt.text,
-                             positions=unique, blocks=tuple(blocks))
+                             positions=unique, blocks=tuple(blocks),
+                             message_sources=tuple(tuple(source) for source in sources))

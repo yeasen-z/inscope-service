@@ -62,7 +62,9 @@ OpenAPI 声明 detect 的单条/批量 requestBody 和 `DetectionResponse` 联�
 
 输入 messages/tools，返回分数、阈值及 label。若业务需要 exists，可显式约定与阈值判定的关系，不静默换字段。`attack` / `benign` 和固定 risk 是当前接口的历史命名，并不让任意探针自动具有相同业务语义。
 
-配置 `INSCOPE_PROBES` 后，同一次特征采集会为所有已加载探针打分，响应追加 `per_risk`/`per_entry`/`triggered_entries`/`enabled_risks`/`disabled_risks`/`overall`/`profile`/`detector_model`/`bank_version`，且 `latency_ms` 变为含 `total` 的映射。顶层 `probability`/`logit`/`label` 仍来自主探针，语义不变。未注册的风险只出现在 `disabled_risks`，不会得到伪造分数。该视图目前只作用于 `/detect`，`/audit`、`/analyze` 仍按主探针工作。
+对于 `fyh.probe_checkpoint.v3` observation-block attention 探针，调用方可传 `"explain": true`。服务在**同一次**特征采集和 attention 打分中追加 `blocks`、`compiled_context`、`capture_positions`、`coordinate_system: "compiled_messages"` 与 `importance_semantics`。`blocks[].attention_weight` 与 `blocks[].attention_contribution` 是当前已编译上下文中的 attention 证据；固定语义文本为 `cached cumulative-prefix evidence, not IPI probabilities`，不得将它们当作 block 独立的 IPI 概率或跨请求可比较的风险分数。`message_index` 属于编译后消息坐标；要定位回调用请求，必须使用 `source_message_indices`。空 anchor 也在 `blocks` 内并参与 attention，不能过滤后再解释归一化权重。
+
+配置 `INSCOPE_PROBES` 后，同一次特征采集会为所有已加载探针打分，响应追加 `per_risk`/`per_entry`/`triggered_entries`/`enabled_risks`/`disabled_risks`/`overall`/`profile`/`detector_model`/`bank_version`，且 `latency_ms` 变为含 `total` 的映射。顶层 `probability`/`logit`/`label` 仍来自主探针，语义不变。未注册的风险只出现在 `disabled_risks`，不会得到伪造分数。该视图目前只作用于 `/detect`，`/audit`、`/analyze` 仍按主探针工作；observation-block 探针不能与多风险 Probe Bank 同实例加载。
 
 ### audit：首次在哪一步检出？
 
@@ -78,5 +80,7 @@ OpenAPI 声明 detect 的单条/批量 requestBody 和 `DetectionResponse` 联�
 ### analyze：所选 observation 中哪些片段相对影响分数？
 
 保留 observation_index、粒度、模式、预算；返回可能不连续的 regions、原文偏移、levels 和不确定状态。无需先调用 detect/audit。定位是相对归因，不是片段绝对恶意性的判决。
+
+对 observation-block attention 探针，`/analyze` 保持原有删/留片段的反事实机制，兼容调用但不是该探针的首选解释路径：删段会改变 block 数量和 attention softmax 的候选集合；删空时只余 empty anchor，形成训练未覆盖的基线。因此可将结果用作片段的**相对排序**，不可将 phi 的绝对值解释成可比较的风险或因果贡献。需要块级解释时，优先使用 `/detect` 的 `explain: true`，它不需要额外前向。
 
 单单元 auto 使用可处理该输入的 exact 路径；数值并列不能武断选出唯一高/低区间，非有限探针分数必须报错，不能伪装成未检出。真实引擎批量协议已跑通，但历史性能快照不是当前身份校验、并发或准确性验收，见 [实测性能](<performance.md>)。
