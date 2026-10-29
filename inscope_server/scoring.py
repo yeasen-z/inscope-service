@@ -91,10 +91,14 @@ class ScoringPipeline:
         blocks = self.profile.position_mode == "blocks"
         try:
             if blocks:
-                from .observation_blocks import compile_observation_blocks
-                plan = await asyncio.to_thread(
-                    compile_observation_blocks, self.state["tokenizer"], messages, tools,
-                    max_prompt_tokens=self.settings.max_tokens)
+                from .observation_blocks import PromptTooLong, compile_observation_blocks
+                try:
+                    plan = await asyncio.to_thread(
+                        compile_observation_blocks, self.state["tokenizer"], messages, tools,
+                        max_prompt_tokens=self.settings.max_tokens)
+                except PromptTooLong as exc:
+                    # 超长不是模板错误：业务侧要能区分「输入太大」和「检测器坏了」。
+                    raise HTTPException(413, str(exc)) from exc
                 return list(plan.input_ids), self.profile.describe(), plan
             # Context Composer 按 profile 产出唯一可用的 input_ids；
             # 后端只允许原样转发，不得重新渲染或重新 tokenize。

@@ -170,3 +170,30 @@ def test_message_sources_handle_dropped_and_merged(tokenizer):
         {"role": "tool", "tool_call_id": "c3", "name": "read", "content": "C1"},
     ])
     assert merged.message_sources == ((0,), (1, 2), (3,))
+
+
+def test_prompt_too_long_is_non_template_failure(tokenizer, block_probe):
+    """超长必须可区分：编译期抛 PromptTooLong，HTTP 层映射 413 而不是 422。"""
+    from fastapi import HTTPException
+
+    from inscope_server.observation_blocks import PromptTooLong, compile_observation_blocks
+    from inscope_server.scoring import ScoringPipeline
+    messages = [{"role": "user", "content": "read it"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "name": "read", "content": "A1\n\nA2"}]
+    with pytest.raises(PromptTooLong):
+        compile_observation_blocks(tokenizer, messages, max_prompt_tokens=2)
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from inscope_server.context_profile import get_profile
+
+    pipeline = ScoringPipeline(
+        {"probe": block_probe, "tokenizer": tokenizer, "backend": None},
+        SimpleNamespace(max_tokens=2, max_inflight=1), get_profile("observation_blocks_v3"))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(pipeline.prepare(messages))
+    assert caught.value.status_code == 413

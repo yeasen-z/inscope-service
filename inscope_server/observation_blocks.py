@@ -32,6 +32,10 @@ SETTING = dict(retain_n_assistant_turns=1, discard_cots=True,
                merge_consecutive_assistants=True, enable_thinking=True, probe_prefix='')
 
 
+class PromptTooLong(ValueError):
+    """编译后的 prompt 超过声明上限；不做截断，交给 HTTP 层映射成 413。"""
+
+
 @dataclass(frozen=True)
 class ObservationBlocks:
     """一次编译的完整产物。blocks 坐标属于编译后 messages（compiled_messages）。"""
@@ -438,7 +442,7 @@ def compile_observation_blocks(tokenizer, messages, tools=None, *,
         raise ValueError("chat template produced an empty prompt")
     prompt = _Prompt(text=canonical_text, token_ids=token_ids)
     if len(prompt.token_ids) > max_prompt_tokens:
-        raise ValueError('Observation-block prompt exceeds token limit; no truncation')
+        raise PromptTooLong('Observation-block prompt exceeds token limit; no truncation')
     encoded = position_tokenizer(prompt.text, add_special_tokens=False, return_offsets_mapping=True)
     if tuple(encoded['input_ids']) != prompt.token_ids:
         raise ValueError('Offset tokenizer differs from the captured prompt')

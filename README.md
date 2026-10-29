@@ -193,7 +193,7 @@ asyncio.run(main())
 
 **当前接口仍有提示注入场景的历史命名**：`label` 使用 `attack` / `benign`，`risk` 固定为 `indirect_prompt_injection`。这些字段目前没有随探针任务动态变化，不能据此宣称服务已支持任意任务语义。接入其他任务时，需要同时适配输出标签与任务元信息；仅替换权重不会自动完成这一步。
 
-常见错误：`401` 鉴权失败、`413` 输入超限、`422` 输入不合法、`429` 并发已满、`503` 特征后端或打分异常、`504` 超时。单条检测失败使用相应 HTTP 状态，不包装成 HTTP 200 的“阴性”。超长输入会被拒绝，不会静默截断。
+常见错误：`401` 鉴权失败、`413` 输入超限、`422` 输入不合法、`429` 并发已满、`503` 特征后端或打分异常、`504` 超时。单条检测失败使用相应 HTTP 状态，不包装成 HTTP 200 的“阴性”。超长输入会被拒绝，不会静默截断；观测块探针的超长同样是 `413`（不是 `422` 模板错误），调用方能区分「输入太大」与「检测器异常」。
 
 批量请求先检查外层结构及整批上限，再逐会话规范化、校验和隔离错误。完整批量响应为 `DetectionBatchResult`：`schema="inscope.detect_batch.v1"`、`count`、有序 `results` 与请求元数据；每项是共享 `DetectionResult` 或含 `error` / `detail` / `status_code` 的 `DetectionItemError`。HTTP 200 不表示所有项成功；整批请求本身的鉴权、大小、准入、结构或总超时失败仍可返回非 200。
 
@@ -274,7 +274,7 @@ audit 按检查点串行推进并走单条采集，没有独立的 audit concurr
 | `INSCOPE_API_KEY` | 必填 | 调用本服务的鉴权口令 |
 | `INSCOPE_ENGINE_URL` | `http://127.0.0.1:30000` | sglang-inscope 引擎地址 |
 | `SGLANG_API_KEY` | 空 | 引擎启用鉴权时使用，与本服务口令不同 |
-| `INSCOPE_MAX_INPUT_TOKENS` | `40959` | 输入 token 上限，可调小 |
+| `INSCOPE_MAX_INPUT_TOKENS` | `40959` | 输入 token 上限，可调小；上界是引擎的模型上下文（40960），编译超过即 `413`，不截断 |
 | `INSCOPE_MAX_BODY_BYTES` | `2097152` | HTTP 请求体字节上限，流式读取时限制 |
 | `INSCOPE_MAX_BATCH_ITEMS` | `128` | detect 整批会话条数上限，不是每桶大小 |
 | `INSCOPE_DETECT_BATCH` | `16` | detect 每桶 prompt 数上限，各桶串行 |
