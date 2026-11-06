@@ -38,9 +38,29 @@ def main(argv=None):
     parser.add_argument("--log-level", default=os.getenv("INSCOPE_LOG_LEVEL", "info"))
     parser.add_argument("--preflight-only", action="store_true",
                         help="只做配置与 checkpoint 校验后退出，不启动服务")
+    parser.add_argument("--pipeline-config", help="Versioned modular detection pipeline JSON")
+    parser.add_argument("--device", default="cuda", help="Probe device in modular pipeline mode")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=args.log_level.upper())
+
+    if args.pipeline_config:
+        from .detection.config import load_config
+        try:
+            load_config(args.pipeline_config)
+            if not os.getenv("INSCOPE_API_KEY"):
+                raise ValueError("INSCOPE_API_KEY is required")
+        except (ValueError, OSError, KeyError) as exc:
+            log.error("Pipeline preflight failed: %s", exc)
+            return 2
+        if args.preflight_only:
+            log.info("Pipeline config and checkpoint identities verified; no GPU/backend started")
+            return 0
+        from .app import create_app
+        uvicorn.run(create_app(pipeline_config=args.pipeline_config,
+            api_key=os.environ["INSCOPE_API_KEY"], device=args.device),
+            host=args.host,port=args.port,log_level=args.log_level,timeout_keep_alive=75)
+        return 0
 
     # 提前校验配置，让缺项在启动前报出来，而不是首个请求时才炸。
     try:

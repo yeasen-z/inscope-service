@@ -47,8 +47,12 @@ READY_PROMPT_BLOCKS = [
 ]
 
 
-def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probes=None):
+def create_app(settings=None, *, tokenizer=None, probe=None, backend=None, probes=None,
+               pipeline_config=None, api_key=None, device="cuda"):
     """Dependencies can be injected for CPU-only protocol tests."""
+    if pipeline_config is not None:
+        from .detection.app import create_pipeline_app
+        return create_pipeline_app(pipeline_config, api_key=api_key, device=device)
     settings = settings or Settings.from_env()
     # profile 必须在启动期解析：未知 id 直接失败，而不是首个请求才暴露。
     profile = get_profile(settings.composer_profile)

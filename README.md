@@ -408,3 +408,11 @@ python -m pytest -q
 ## License
 
 见 [LICENSE](<LICENSE>)。
+
+## Modular all-position detector runtime
+
+The opt-in pipeline mode adds composer/planner/capture/placement-aware transport,
+resident multi-detector inference, microbatching and deployment post-processing.
+It preserves the legacy message API and keeps evaluation outside the service.
+See [modular detection pipeline](docs/modular-detection-pipeline.md) for contracts,
+CUDA IPC/P2P placement, launch commands and validation limits.
